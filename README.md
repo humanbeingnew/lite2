@@ -1,5 +1,18 @@
-# Lite Paragraph Summarizer V37
+# Lite Paragraph Summarizer V38
 
-V37 focuses on global compression instead of independent paragraph compression. The target is roughly 53% of the source length while preserving key facts, numbers, conditions, causes/effects and conclusions.
+V38은 기존의 **중요 문장 선택형 요약**에서 **정보 단위 재조합형 요약**으로 방향을 전환한 버전입니다.
 
-No external AI API or API key is required.
+### 핵심 설계
+- 전체 원문을 하나의 요약 예산으로 처리
+- 핵심 주장 / 원인·근거 / 대표 사례 / 숫자 / 결론을 별도 정보 단위로 평가
+- 긴 기사에서는 앞부분의 주제, 중간의 근거·사례, 마지막 결론을 함께 확보
+- 중간 사례들을 재조합해 중요한 문장을 단순 삭제하지 않음
+- 숫자를 보존하되 숫자가 포함된 원문 문장 전체를 그대로 보존하지 않음
+- 원문의 문단 경계가 최종 요약 길이를 다시 늘리지 않도록 통합 출력
+- 기존 URL 추출, 본문 추출, Cloudflare Worker 구조 유지
+
+### 목표
+일반적으로 원문의 약 53%를 목표로 하며, 정보 손실이 큰 경우 무리한 압축을 피합니다.
+
+### 테스트
+`V38-TEST-REPORT.md`와 `V38-REGRESSION.txt`에 회귀 테스트 결과가 포함되어 있습니다.

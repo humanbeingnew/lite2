@@ -2,7 +2,7 @@
   "name": "lite-paragraph-summarizer",
   "private": true,
   "type": "module",
-  "version": "36.0.0",
+  "version": "38.0.0",
   "description": "Free Korean news and document summarizer for Cloudflare Workers",
   "scripts": {
     "dev": "wrangler dev",

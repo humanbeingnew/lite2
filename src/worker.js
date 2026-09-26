@@ -220,7 +220,10 @@ function summarize(text) {
  // V37: 전체 글을 하나의 예산으로 압축한다.
  const summary = summarizeParagraphFinalV33(source, context);
  if (!summary) return "";
- let compact = fitGlobalSummaryToTargetV36(summary, source);
+ let compact = fitGlobalSummaryToTargetV38(summary, source);
+ // V38 안전선: 전체 정보 예산의 절반보다 지나치게 짧아졌다면 원래 구조형 요약을 복구한다.
+ // 짧은 정책/뉴스에서 한 문장만 남는 과압축을 방지한다.
+ if(source.length>=180 && compact.length < Math.round(source.length*0.30)) compact = summary;
  const terminalSource = splitSentences(source).at(-1) || '';
  const terminalMarkers = terminalSource.match(/유일한 정답|셈이다|결론적으로|핵심은|진짜 영감|마련되어야 한다|선행되어야 한다|해야 한다|필요하다/gu) || [];
  if (terminalMarkers.length && !terminalMarkers.some(m=>compact.includes(m))) {
@@ -232,13 +235,240 @@ function summarize(text) {
  }
  let parts = splitSentences(compact);
  if (parts.length > 3) {
-  const ranked = parts.map((p,i)=>({p,i,score:(extractNumericFactsV32(p).size*20)+(extractFactTokens(p).size*3)+((/결국|따라서|결론적으로|유일한 정답|셈이다|진짜 영감|해야 한다|필요하다/u.test(p))?35:0)+((hasTransitionMarkerV27(p)||hasPerspectiveShift(p))?10:0)}));
-  parts = ranked.sort((a,b)=>b.score-a.score).slice(0,3).sort((a,b)=>a.i-b.i).map(x=>x.p);
+  // V38: 정보 단위를 버리지 않고 가운데 사례들을 하나의 문장으로 재조합한다.
+  // 기존 V37의 점수 상위 3개 선택은 기사 초반의 주제나 근거를 통째로 버릴 수 있었다.
+  const first=parts[0];
+  const last=parts[parts.length-1];
+  const middle=parts.slice(1,-1).map(stripTerminalPunctuation).join('; 또한 ') + (parts.length>2 ? '.' : '');
+  const merged=[first,middle,last].filter(Boolean);
+  parts=merged.length===3 ? merged : parts.slice(0,3);
  }
- if (groups.length <= 1 || parts.length <= 1) return parts.join(' ');
- const buckets = Array.from({length: groups.length}, () => []);
- parts.forEach((p,i) => buckets[Math.min(groups.length-1, Math.floor(i*groups.length/parts.length))].push(p));
- return buckets.filter(Boolean).map(b=>b.join(' ')).filter(Boolean).join('\n\n');
+ // V38에서는 요약 자체를 하나의 정보 구조로 취급한다. 원문의 문단 경계가
+ // 최종 요약 문장 수를 다시 늘리지 않도록 항상 하나의 흐름으로 반환한다.
+ return parts.join(' ');
+}
+
+
+// V38: 문장 선택형에서 정보 단위 재조합형으로 전환한다.
+// 핵심 주장/근거/사례/수치/결론을 서로 다른 단위로 확보한 뒤 하나의 짧은 요약으로 재구성한다.
+function fitGlobalSummaryToTargetV38(summary, original) {
+ const src=normalize(original);
+ if(!src) return normalize(summary);
+ const target=Math.max(90,Math.round(src.length*0.53));
+ const hard=target+Math.max(14,Math.round(target*0.12));
+ const sourceSentences=splitSentences(src);
+ if(src.length<180) return compactSummarySentenceV34(summary,src)||normalize(summary);
+
+ const units=[];
+ const seen=new Set();
+ sourceSentences.forEach((sentence,si)=>{
+  const pieces=decomposeSentenceForFinalV33(sentence);
+  const usable=pieces.length?pieces:[sentence];
+  usable.forEach((raw,pi)=>{
+   let t=normalize(raw);
+   if(!t || tokenize(t).length<5) return;
+   t=completeFinalClauseV33(stripTerminalPunctuation(t)) || t;
+   t=compactFinalSentenceV33(t,src) || t;
+   t=makeOneSentence(t);
+   if(!t || t.length<24) return;
+   if(t.length>Math.max(150,Math.round(target*.72))) t=makeOneSentence(safeCompressLongSentence(t));
+   if(t.length>Math.max(150,Math.round(target*.72)) || t.length<24) return;
+   const key=stripTerminalPunctuation(t);
+   if(seen.has(key)) return; seen.add(key);
+   const roles=classifyLogicalRolesV25(t);
+   const nums=extractNumericFactsV32(t);
+   const facts=extractFactTokens(t);
+   const anchors=extractInformationAnchors(t);
+   const conclusion=roles.has('conclusion') || strongTerminalConclusionU33(t) || /(?:결국|따라서|핵심은|결론적으로|필요하다|해야 한다|전망)/u.test(t);
+   const evidence=roles.has('fact') || nums.size>0 || /(?:예를 들어|실제|미국|중국|한국|기업|연구|자료|영상|데이터)/u.test(t);
+   const cause=roles.has('cause')||roles.has('effect')||roles.has('limitation');
+   const claim=roles.has('claim')||si===0;
+   let score=facts.size*2.2+anchors.size*1.1+nums.size*7+roles.size*3;
+   if(claim) score+=8; if(cause) score+=10; if(evidence) score+=9; if(conclusion) score+=16;
+   if(si===0) score+=3; if(si===sourceSentences.length-1) score+=4;
+   units.push({text:t,si,pi,roles,nums,facts,anchors,claim,cause,evidence,conclusion,score});
+  });
+ });
+ if(!units.length) return normalize(summary);
+
+ const allNums=new Set(extractNumericFactsV32(src));
+ const allFacts=new Set(extractFactTokens(src));
+ const allAnchors=new Set(units.flatMap(u=>[...u.anchors]));
+ const hasConclusion=units.some(u=>u.conclusion);
+ const roleNeed=(name)=>units.some(u=>u.roles.has(name));
+ const quality=set=>{
+  const text=set.map(x=>x.text).join(' ');
+  const nums=new Set(set.flatMap(x=>[...x.nums]));
+  const facts=new Set(set.flatMap(x=>[...x.facts]));
+  const anchors=new Set(set.flatMap(x=>[...x.anchors]));
+  let q=set.reduce((n,x)=>n+x.score,0);
+  q += nums.size*8 + facts.size*1.6 + anchors.size*.8;
+  if(allNums.size) q += (nums.size/allNums.size)*18;
+  if(hasConclusion && set.some(x=>x.conclusion)) q+=28;
+  if(roleNeed('cause') && set.some(x=>x.cause)) q+=20;
+  if(roleNeed('fact') && set.some(x=>x.evidence)) q+=12;
+  if(set.some(x=>x.claim)) q+=14;
+  // 서로 다른 정보 단위를 골랐는지 보상한다.
+  q += new Set(set.map(x=>x.si)).size*5;
+  if(set.some(x=>x.si<=1)) q+=32;
+  if(set.some(x=>x.si>=sourceSentences.length-2 || x.conclusion)) q+=24;
+  // 목표보다 지나치게 짧은 조합은 정보 손실로 간주한다.
+  const len=text.length;
+  q -= Math.max(0,target*.76-len)*.22;
+  q -= Math.max(0,len-hard)*2;
+  return q;
+ };
+ let best=null;
+ const consider=set=>{
+  if(!set.length || set.length>5) return;
+  const ordered=[...set].sort((a,b)=>a.si-b.si||a.pi-b.pi);
+  const text=ordered.map(x=>x.text).join(' ');
+  const len=text.length;
+  if(len>hard || len<target*.58) return;
+  // 같은 원문 문장에서 지나치게 중복된 절은 제거한다.
+  const unique=[];
+  for(const u of ordered){
+   if(unique.some(v=>sentenceSimilarity(tokenize(v.text),tokenize(u.text))>=.78)) continue;
+   unique.push(u);
+  }
+  if(unique.length!==ordered.length) return;
+  // 긴 기사에서는 특정 사례 하나만 고르는 것을 막고, 앞부분의 주제·중간의 근거·마지막 결론을 분산 확보한다.
+  if(sourceSentences.length>=5){
+   const early=unique.some(u=>u.si<=Math.max(1,Math.floor(sourceSentences.length*.28)));
+   const middle=unique.some(u=>u.si>=Math.floor(sourceSentences.length*.25) && u.si<Math.ceil(sourceSentences.length*.75));
+   const terminal=unique.some(u=>u.conclusion || u.si>=sourceSentences.length-2);
+   if(!early || !middle || !terminal) return;
+  }
+  const q=quality(unique);
+  if(!best || q>best.q) best={set:unique,q,len};
+ };
+
+ const ranked=[...units].sort((a,b)=>b.score-a.score);
+ const claims=units.filter(x=>x.claim).sort((a,b)=>b.score-a.score).slice(0,8);
+ const causes=units.filter(x=>x.cause).sort((a,b)=>b.score-a.score).slice(0,10);
+ const evidences=units.filter(x=>x.evidence).sort((a,b)=>b.score-a.score).slice(0,10);
+ const conclusions=units.filter(x=>x.conclusion).sort((a,b)=>b.score-a.score).slice(0,8);
+ // 핵심 주장 + 근거/사례 + 결론을 먼저 탐색한다.
+ for(const a of claims) for(const b of evidences) for(const c of conclusions) {
+  if(a===b||b===c||a===c) continue;
+  consider([a,b,c]);
+ }
+ // 원인/영향 + 사례 + 결론 조합.
+ for(const a of causes) for(const b of evidences) for(const c of conclusions) {
+  if(a===b||b===c||a===c) continue;
+  consider([a,b,c]);
+ }
+ // 4단위 조합은 길이가 허용되는 경우에만 사용한다.
+ for(const a of ranked.slice(0,10)) for(const b of ranked.slice(0,10)) for(const c of ranked.slice(0,10)) for(const d of ranked.slice(0,10)) {
+  const arr=[a,b,c,d]; if(new Set(arr).size<4) continue;
+  consider(arr);
+ }
+ // 구조 보존 패스: 긴 기사에서는 앞의 주제, 중간 사례, 마지막 결론을 함께 담은 조합을 별도로 평가한다.
+ if(sourceSentences.length>=5){
+  const pool=[...units].filter(u=>u.si<=2 || (u.si>=2 && u.si<=sourceSentences.length-3) || u.si>=sourceSentences.length-2);
+  for(let i=0;i<pool.length;i++) for(let j=i+1;j<pool.length;j++) for(let k=j+1;k<pool.length;k++) for(let l=k+1;l<pool.length;l++) {
+   const arr=[pool[i],pool[j],pool[k],pool[l]];
+   const early=arr.some(u=>u.si<=1), middle=arr.some(u=>u.si>=2 && u.si<sourceSentences.length-2), terminal=arr.some(u=>u.conclusion || u.si>=sourceSentences.length-2);
+   if(!early||!middle||!terminal) continue;
+   consider(arr);
+  }
+  for(let i=0;i<pool.length;i++) for(let j=i+1;j<pool.length;j++) for(let k=j+1;k<pool.length;k++){
+   const arr=[pool[i],pool[j],pool[k]];
+   const early=arr.some(u=>u.si<=1), middle=arr.some(u=>u.si>=2 && u.si<sourceSentences.length-2), terminal=arr.some(u=>u.conclusion || u.si>=sourceSentences.length-2);
+   if(early&&middle&&terminal) consider(arr);
+  }
+ }
+ // 최종 안전망
+ if(!best){
+  for(const a of ranked.slice(0,12)) consider([a]);
+  for(let i=0;i<Math.min(12,ranked.length);i++) for(let j=i+1;j<Math.min(14,ranked.length);j++) consider([ranked[i],ranked[j]]);
+ }
+ if(!best) return normalize(summary);
+ // 짧은 2~4문장 글은 한 문장만 남겨 지나치게 짧아지는 것을 방지한다.
+ const bestLen=best.set.reduce((n,x)=>n+x.text.length,0)+Math.max(0,best.set.length-1);
+ if(sourceSentences.length<5 && bestLen<target*.70){
+  let pairBest=best;
+  for(let i=0;i<units.length;i++) for(let j=i+1;j<units.length;j++) {
+   const pair=[units[i],units[j]].sort((a,b)=>a.si-b.si);
+   const len=pair[0].text.length+pair[1].text.length+1;
+   if(len>hard || len<target*.55) continue;
+   if(pair.some(x=>sentenceSimilarity(tokenize(x.text),tokenize(pair[0].text))>=.90 && x!==pair[0])) continue;
+   const q=quality(pair);
+   if(!pairBest || q>pairBest.q) pairBest={set:pair,q,len};
+  }
+  best=pairBest;
+ }
+ let out=best.set.map(x=>x.text).join(' ');
+ const parts=splitSentences(out);
+ // 3문장 안에서 정보 단위를 재조립한다. 지나치게 긴 문장은 기존 안전 압축을 적용한다.
+ let final=parts.map(p=>{
+  let t=makeOneSentence(p);
+  if(t.length>Math.round(target*.55)) t=makeOneSentence(compactSummarySentenceV34(t,src)||safeCompressLongSentence(t));
+  return t;
+ }).filter(Boolean);
+ if(best.set.length>=4 && final.length>3){
+  // 정보 단위를 세 문장으로 재조립: 주제 / 복수 사례 / 결론.
+  const ord=[...best.set].sort((a,b)=>a.si-b.si||a.pi-b.pi);
+  const first=ord[0].text;
+  const last=ord[ord.length-1].text;
+  const middle=ord.slice(1,-1).map(x=>x.text).join(' ');
+  const rebuilt=[first,middle,last].map(x=>makeOneSentence(x)).filter(Boolean);
+  if(rebuilt.join(' ').length<=hard) final=rebuilt;
+ }
+ if(sourceSentences.length>=5){
+  const early=[...units].filter(u=>u.si<=1).sort((a,b)=>b.score-a.score)[0];
+  const terminal=[...units].filter(u=>u.conclusion || u.si>=sourceSentences.length-2).sort((a,b)=>b.score-a.score)[0];
+  const mids=[...units].filter(u=>u!==early && u!==terminal && u.si>=2 && u.si<sourceSentences.length-2);
+  const midEarly=[...mids].sort((a,b)=>a.si-b.si||b.score-a.score)[0];
+  const midLate=[...mids].filter(u=>u!==midEarly).sort((a,b)=>b.score-a.score)[0];
+  if(early && terminal && mids.length){
+   const middleUnits=[midEarly,midLate].filter(Boolean);
+   let middleText=middleUnits.map(x=>x.text).join(' ');
+   middleText=makeOneSentence(middleText);
+   if(middleText.length>Math.round(target*.58)) middleText=makeOneSentence(compactSummarySentenceV34(middleText,src)||safeCompressLongSentence(middleText));
+   const rebuilt=[early.text,middleText,terminal.text].map(x=>makeOneSentence(x)).filter(Boolean);
+   let rebuiltText=rebuilt.join(' ');
+   if(rebuiltText.length>hard){
+    const compressed=rebuilt.map(x=>x.length>Math.round(target*.55)?makeOneSentence(compactSummarySentenceV34(x,src)||safeCompressLongSentence(x)):x);
+    if(compressed.join(' ').length<=hard) rebuiltText=compressed.join(' ');
+   }
+   if(rebuiltText.length<=hard && rebuiltText.length>=target*.50) final=splitSentences(rebuiltText);
+  }
+ }
+
+ if(final.length>3){
+  final=final.sort((a,b)=>{
+   const sa=extractNumericFactsV32(a).size*12+extractInformationAnchors(a).size+(strongTerminalConclusionU33(a)?20:0);
+   const sb=extractNumericFactsV32(b).size*12+extractInformationAnchors(b).size+(strongTerminalConclusionU33(b)?20:0);
+   return sb-sa;
+  }).slice(0,3);
+ }
+ final=final.filter((x,i)=>!final.some((y,j)=>j<i && sentenceSimilarity(tokenize(x),tokenize(y))>=.98));
+ // 정보 구조가 긴 기사라면 첫 핵심 주장도 반드시 한 번 검토한다.
+ const currentText=()=>final.join(' ');
+ if(sourceSentences.length>=5 && !final.some(x=>units.some(u=>u.text===x && u.si<=1))){
+  const early=[...units].filter(u=>u.si<=1).sort((a,b)=>b.score-a.score);
+  for(const u of early){
+   let t=makeOneSentence(u.text);
+   if(t.length>hard-currentText().length) t=makeOneSentence(compactSummarySentenceV34(t,src)||safeCompressLongSentence(t));
+   if(t && currentText().length+t.length+1<=hard){ final.unshift(t); break; }
+  }
+ }
+ // 목표 길이보다 지나치게 짧으면 아직 선택되지 않은 정보 단위를 하나 추가한다.
+ if(sourceSentences.length<5 && final.join(' ').length < target*.78){
+  const used=new Set(final);
+  const extras=[...units].sort((a,b)=>b.score-a.score);
+  for(const u of extras){
+   if(used.has(u.text)) continue;
+   let t=makeOneSentence(u.text);
+   const room=hard-final.join(' ').length-1;
+   if(t.length>room) t=makeOneSentence(compactSummarySentenceV34(t,src)||safeCompressLongSentence(t));
+   if(!t || t.length>room) continue;
+   final.push(t); used.add(t);
+   if(final.join(' ').length>=target*.78 || final.length>=3) break;
+  }
+ }
+ return final.join(' ');
 }
 
 function fitGlobalSummaryToTargetV36(summary, original) {
