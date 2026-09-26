@@ -2,13 +2,13 @@
   "name": "lite-paragraph-summarizer",
   "private": true,
   "type": "module",
-  "version": "38.0.0",
-  "description": "Free Korean news and document summarizer for Cloudflare Workers",
+  "version": "39.0.0",
+  "description": "Free Korean news and document summarizer for Cloudflare Workers (V39rr 35% target, 30-45% range)",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check": "node --check src/worker.js",
-    "test": "node test.mjs"
+    "test": "node regression-v39rr.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.140.0"

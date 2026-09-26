@@ -14,9 +14,9 @@ input,textarea{width:100%;padding:12px;border:1px solid #ccc;border-radius:10px;
 .result{line-height:1.8}.summary-lines{display:grid;gap:12px}.summary-line{white-space:normal;overflow:visible;word-break:keep-all}.small{font-size:12px;color:#777;margin-top:7px}
 </style></head>
 <body><main>
-<h1>⚡ Lite 문단 요약기</h1><p class="sub">AI API 없이 각 문단의 핵심을 한 문장으로 요약합니다.</p>
+<h1>⚡ Lite 문단 요약기</h1><p class="sub">AI API 없이 핵심 주장·근거·숫자를 보존하며 원문의 약 35%로 압축합니다. (허용 30~45%)</p>
 <section class="card"><input id="url" placeholder="웹페이지 URL"><div class="row"><button id="fetch">본문 가져오기</button></div><div class="small">일부 사이트는 보안 정책 때문에 가져오지 못할 수 있습니다.</div></section>
-<section class="card"><textarea id="text" placeholder="긴 글을 붙여넣으세요."></textarea><div class="row"><button id="sum">문단별 요약</button><button class="secondary" id="clear">지우기</button></div></section>
+<section class="card"><textarea id="text" placeholder="긴 글을 붙여넣으세요."></textarea><div class="row"><button id="sum">요약하기</button><button class="secondary" id="clear">지우기</button></div></section>
 <section class="card">
 <div class="switch"><span>🖼 이미지/동영상 숨김</span><button class="toggle on" id="media"><i></i></button></div>
 <div class="switch"><span>📢 광고 숨김</span><button class="toggle on" id="ads"><i></i></button></div>
