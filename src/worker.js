@@ -2,6 +2,11 @@ export default {
  async fetch(request, env) {
   const u = new URL(request.url);
 
+  // 배포 확인용 경량 헬스체크. API가 살아 있는지 JSON으로 바로 확인할 수 있다.
+  if (request.method === "GET" && u.pathname === "/api/health") {
+   return json({ ok: true, service: "lite-paragraph-summarizer", version: "39.1.0" });
+  }
+
   if (request.method === "POST" && u.pathname === "/api/summarize") {
    try {
     const body = await request.json();
@@ -217,8 +222,10 @@ function summarize(text) {
  // 전체 글을 하나의 정보 덩어리로 보고, 숫자는 별도의 보호 우선순위로 관리한다.
  // 이렇게 해야 여러 문단의 원인→영향→대안/전망 구조가 유지되면서 전체 길이도 함께 줄어든다.
 
- // V37: 전체 글을 하나의 예산으로 압축한다.
- const summary = summarizeParagraphFinalV33(source, context);
+ // V39rr hotfix: V39rr의 최종 압축기는 원문에서 정보 단위를 직접 만들기 때문에
+ // 선행 V33 전체 요약을 다시 계산할 필요가 없다. 이 중복 계산은 Cloudflare Free의
+ // 10ms CPU 한도에서 특히 치명적이므로 제거하고, 원문을 fallback seed로 사용한다.
+ const summary = source;
  if (!summary) return "";
  let compact = fitGlobalSummaryToTargetV39(summary, source);
  // V39rr는 35% 목표와 30~45% 허용범위를 직접 관리한다.
@@ -802,8 +809,36 @@ function fitGlobalSummaryToTargetV39(summary, original){
   return score;
  };
 
- const bestInRange=[];
- const maxCount=Math.min(4,pool.length);
+ // V39rr hotfix: 이전 버전은 pool 전체에 대해 1~4개 후보 조합을 전부 탐색했다.
+ // 기사 문장이 많아지면 O(n^4)까지 커져 Cloudflare Worker 실행 부담이 커질 수 있다.
+ // 정보 구조는 유지하되, 유력 후보만 제한적으로 조합 탐색한다.
+ const candidatePriority=(c)=>{
+  const kindBonus={
+   'core-package':180,'contrast-package':165,'core-stats':125,'cross-stats':115,
+   'numeric-terminal':105,'fact-bundle':90,'rank-duration':72,'terminal-bundle':60,
+   'study-method':24,'pair':18,'unit':12,'source':10
+  };
+  let n=kindBonus[c.kind]||0;
+  n+=c.nums.size*16+c.anchors.size*3+c.facts.size*1.2;
+  if(c.sourceIndices.includes(0)) n+=26;
+  if(c.sourceIndices.includes(sourceSentences.length-1)) n+=20;
+  if(c.conclusion) n+=24;
+  if(c.transition) n+=12;
+  n-=Math.abs(c.text.length-targetLen)*0.08;
+  return n;
+ };
+ const requiredKinds=/^(?:core-package|contrast-package|core-stats|cross-stats|numeric-terminal|fact-bundle|rank-duration|terminal-bundle)$/u;
+ const mustKeep=pool.filter(c=>requiredKinds.test(c.kind));
+ const rankedPool=[...pool].sort((a,b)=>candidatePriority(b)-candidatePriority(a));
+ const searchPool=[];
+ const pushSearch=(c)=>{ if(c && !searchPool.includes(c)) searchPool.push(c); };
+ mustKeep.forEach(pushSearch);
+ rankedPool.forEach(pushSearch);
+ // 일반 기사에서도 후보가 수백 개로 불어나지 않도록 상한을 둔다.
+ searchPool.splice(24);
+ const quadPool=searchPool.slice(0,14);
+
+ let best=null;
  const consider=(set)=>{
   const spans=[];
   for(const c of set) for(const i of c.sourceIndices) spans.push(i);
@@ -813,24 +848,26 @@ function fitGlobalSummaryToTargetV39(summary, original){
   const positions=[...new Set(set.flatMap(c=>c.sourceIndices))];
   if(sourceSentences.length>=5 && openingImportant && !positions.includes(0)) return;
   if(sourceSentences.length>=7 && hasStrongTerminal && !set.some(c=>c.sourceIndices.includes(sourceSentences.length-1) || c.conclusion)) return;
-  // 원문 순서를 유지한다.
   const ordered=[...set].sort((a,b)=>a.start-b.start);
   if(ordered.some((c,i)=>c!==ordered[i])) return;
   const score=scoreSet(ordered);
-  bestInRange.push({set:ordered,len,score});
+  if(!best || score>best.score) best={set:ordered,len,score};
  };
- for(let i=0;i<pool.length;i++) consider([pool[i]]);
- if(maxCount>=2) for(let i=0;i<pool.length;i++) for(let j=i+1;j<pool.length;j++) consider([pool[i],pool[j]]);
- if(maxCount>=3) for(let i=0;i<pool.length;i++) for(let j=i+1;j<pool.length;j++) for(let k=j+1;k<pool.length;k++) consider([pool[i],pool[j],pool[k]]);
- if(maxCount>=4) for(let i=0;i<pool.length;i++) for(let j=i+1;j<pool.length;j++) for(let k=j+1;k<pool.length;k++) for(let l=k+1;l<pool.length;l++) consider([pool[i],pool[j],pool[k],pool[l]]);
 
- let best=null;
- for(const item of bestInRange){
-  if(!best || item.score>best.score) best=item;
- }
- // 핵심 통계 묶음/대조 묶음이 단독으로 30~45% 범위를 만족하면 다른 주변 숫자 목록보다 우선한다.
- const preferred=bestInRange.find(item=>item.set.length===1 && (item.set[0].kind==='core-package' || item.set[0].kind==='contrast-package'));
+ // 1~3개 조합은 24개 상위 후보, 4개 조합은 그중 14개만 사용한다.
+ for(const c of searchPool) consider([c]);
+ for(let i=0;i<searchPool.length;i++) for(let j=i+1;j<searchPool.length;j++) consider([searchPool[i],searchPool[j]]);
+ for(let i=0;i<searchPool.length;i++) for(let j=i+1;j<searchPool.length;j++) for(let k=j+1;k<searchPool.length;k++) consider([searchPool[i],searchPool[j],searchPool[k]]);
+ for(let i=0;i<quadPool.length;i++) for(let j=i+1;j<quadPool.length;j++) for(let k=j+1;k<quadPool.length;k++) for(let l=k+1;l<quadPool.length;l++) consider([quadPool[i],quadPool[j],quadPool[k],quadPool[l]]);
+
+ // 핵심 패키지가 단독으로 허용 범위에 들어오면 우선한다.
+ const preferred=searchPool
+  .filter(c=>/^(?:core-package|contrast-package)$/u.test(c.kind))
+  .map(c=>({set:[c],len:c.text.length,score:scoreSet([c])}))
+  .filter(x=>x.len>=minLen && x.len<=maxLen)
+  .sort((a,b)=>b.score-a.score)[0];
  if(preferred) best=preferred;
+
  if(!best){
   // 범위 안 후보가 없다면 최대 길이 이하에서 가장 정보량 높은 조합을 선택한다.
   let fallback=null;
@@ -845,9 +882,9 @@ function fitGlobalSummaryToTargetV39(summary, original){
    const score=scoreSet(set)-Math.max(0,minLen-len)*0.8;
    if(!fallback||score>fallback.score) fallback={set:[...set].sort((a,b)=>a.start-b.start),len,score};
   };
-  for(let i=0;i<pool.length;i++) considerFallback([pool[i]]);
-  for(let i=0;i<pool.length;i++) for(let j=i+1;j<pool.length;j++) considerFallback([pool[i],pool[j]]);
-  for(let i=0;i<pool.length;i++) for(let j=i+1;j<pool.length;j++) for(let k=j+1;k<pool.length;k++) considerFallback([pool[i],pool[j],pool[k]]);
+  for(const c of searchPool) considerFallback([c]);
+  for(let i=0;i<searchPool.length;i++) for(let j=i+1;j<searchPool.length;j++) considerFallback([searchPool[i],searchPool[j]]);
+  for(let i=0;i<searchPool.length;i++) for(let j=i+1;j<searchPool.length;j++) for(let k=j+1;k<searchPool.length;k++) considerFallback([searchPool[i],searchPool[j],searchPool[k]]);
   if(fallback) best=fallback;
  }
  if(!best) return normalize(summary);

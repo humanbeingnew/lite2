@@ -27,6 +27,17 @@ input,textarea{width:100%;padding:12px;border:1px solid #ccc;border-radius:10px;
 const $=x=>document.getElementById(x);let media=true,ads=true;
 function renderSummary(s){const lines=String(s||"").split(/\n+/).map(x=>x.trim()).filter(Boolean);if(!lines.length)return "요약 결과가 없습니다.";return `<div class="summary-lines">${lines.map(x=>`<div class="summary-line">${escapeHtml(x)}</div>`).join("")}</div>`}
 function escapeHtml(s){return s.replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]))}
+async function readApi(r){
+ const raw=await r.text();
+ let d=null;
+ try{d=raw?JSON.parse(raw):null}catch(_){}
+ if(!d){
+  const preview=raw.replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim().slice(0,180);
+  throw Error(`서버 오류 (${r.status}). ${preview||"응답 내용을 읽을 수 없습니다."}`);
+ }
+ if(!r.ok) throw Error(d.detail?d.error+" ("+d.detail+")":(d.error||`서버 오류 (${r.status})`));
+ return d;
+}
 
 function tog(id,s){$(id).classList.toggle("on",s)}
 $("media").onclick=()=>{media=!media;tog("media",media)};$("ads").onclick=()=>{ads=!ads;tog("ads",ads)};
@@ -34,11 +45,11 @@ $("clear").onclick=()=>{$("text").value="";$("url").value="";$("result").textCon
 $("sum").onclick=async()=>{
  const text=$("text").value.trim();if(!text){$("result").textContent="요약할 글을 먼저 입력하세요.";return}
  $("result").textContent="핵심 문장을 찾는 중...";
- try{let r=await fetch("/api/summarize",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});let d=await r.json();if(!r.ok)throw Error(d.detail?d.error+" ("+d.detail+")":d.error);$("result").innerHTML=renderSummary(d.summary)}catch(e){$("result").textContent=e.message}
+ try{let r=await fetch("/api/summarize",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});let d=await readApi(r);$("result").innerHTML=renderSummary(d.summary)}catch(e){$("result").textContent=e.message}
 };
 $("fetch").onclick=async()=>{
  const url=$("url").value.trim();if(!url){$("result").textContent="URL을 입력하세요.";return}
  $("result").textContent="본문 가져오는 중...";
- try{let r=await fetch("/api/fetch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});let d=await r.json();if(!r.ok)throw Error(d.error);$("text").value=d.text;$("result").textContent="본문을 가져왔습니다. '문단별 요약'을 눌러주세요."}catch(e){$("result").textContent=e.message}
+ try{let r=await fetch("/api/fetch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});let d=await readApi(r);$("text").value=d.text;$("result").textContent="본문을 가져왔습니다. '문단별 요약'을 눌러주세요."}catch(e){$("result").textContent=e.message}
 };
 </script></body></html>
