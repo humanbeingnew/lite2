@@ -2,13 +2,16 @@
   "name": "lite-paragraph-summarizer",
   "private": true,
   "type": "module",
-  "version": "39.1.0",
-  "description": "Free Korean news and document summarizer for Cloudflare Workers (V39rr Hotfix 39.1.0, 35% target, 30-45% range)",
+  "version": "41.0.0",
+  "description": "Free Korean news and document summarizer for Cloudflare Workers (V41 Coherent Content, 35% target, 30-45% range)",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check": "node --check src/worker.js",
-    "test": "node regression-v39rr.mjs"
+    "test": "node regression-v41.mjs",
+    "audit": "node content-audit-v41.mjs",
+    "mix": "node mixing-v41.mjs",
+    "stress": "node stress-v41.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.140.0"

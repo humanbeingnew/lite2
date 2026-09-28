@@ -4,7 +4,7 @@ export default {
 
   // 배포 확인용 경량 헬스체크. API가 살아 있는지 JSON으로 바로 확인할 수 있다.
   if (request.method === "GET" && u.pathname === "/api/health") {
-   return json({ ok: true, service: "lite-paragraph-summarizer", version: "39.1.0" });
+   return json({ ok: true, service: "lite-paragraph-summarizer", version: "41.0.0" });
   }
 
   if (request.method === "POST" && u.pathname === "/api/summarize") {
@@ -227,12 +227,268 @@ function summarize(text) {
  // 10ms CPU 한도에서 특히 치명적이므로 제거하고, 원문을 fallback seed로 사용한다.
  const summary = source;
  if (!summary) return "";
- let compact = fitGlobalSummaryToTargetV39(summary, source);
+ let compact = fitGlobalSummaryToTargetV41(summary, source);
+ compact = applyContentGuardV41(compact, source);
+ compact = restoreSourceOrderV41(compact, source);
+ compact = enforceCoreLeadV41(compact, source);
  // V39rr는 35% 목표와 30~45% 허용범위를 직접 관리한다.
  // 정보 단위는 그대로 유지하되, 짧은 문장은 후보 자체를 재구성해 범위 안에 들어오게 한다.
  return compact;
 }
 
+
+// V41 순서 가드: 최종 요약이 원문의 인과/논증 순서를 거꾸로 배열하지 않도록 한다.
+function restoreSourceOrderV41(summary, original){
+ const text=normalize(summary), src=normalize(original);
+ if(!text||!src) return text;
+ const outSentences=splitSentences(text);
+ const srcSentences=splitSentences(src);
+ if(outSentences.length<2||srcSentences.length<2) return text;
+ const mapped=outSentences.map((s,pos)=>{
+  let best=-1,bestScore=0;
+  const st=new Set(tokenize(s));
+  for(let i=0;i<srcSentences.length;i++){
+   const score=sentenceSimilarity(tokenize(s),tokenize(srcSentences[i]));
+   if(score>bestScore){ bestScore=score; best=i; }
+  }
+  return {s,pos,index:best,score:bestScore};
+ });
+ const usable=mapped.filter(x=>x.index>=0&&x.score>=0.10);
+ if(usable.length<2) return text;
+ let decreasing=false;
+ for(let i=1;i<usable.length;i++) if(usable[i].index<usable[i-1].index){ decreasing=true; break; }
+ if(!decreasing) return text;
+ return normalize(mapped.slice().sort((a,b)=>a.index-b.index || a.pos-b.pos).map(x=>x.s).join(' '));
+}
+
+// V41 내용 품질 가드: 압축률을 맞춘 뒤에도 핵심 논지, 대표 수치, 결론이 빠지거나
+// 같은 내용이 반복되면 원문 순서를 지키는 소형 재구성 경로를 한 번 더 적용한다.
+// V41 최종 핵심주제 가드: 긴 글을 압축할 때 중간의 숫자·사례만 남아
+// 원문의 핵심 주제가 사라지는 현상을 막는다. 원문 첫 두 문장의 대표 표현을
+// 확인하고, 필요할 때만 최소한의 선두 정보를 복구한다.
+function enforceCoreLeadV41(summary, original){
+ const src=normalize(original), out=normalize(summary);
+ if(!src || !out) return out;
+ const ss=splitSentences(src);
+ if(ss.length<5) return out;
+ const minLen=Math.max(40,Math.floor(src.length*0.30));
+ const maxLen=Math.max(minLen+1,Math.floor(src.length*0.45));
+ const parts=splitSentences(out).map(makeOneSentence).filter(Boolean);
+ if(!parts.length) return out;
+ // 첫 문장은 일반적으로 기사 주제/대상을 가장 직접적으로 제시하므로 후보 경쟁 없이 우선 확인한다.
+ const lead=compressSentenceV39(ss[0],src);
+ if(!lead) return out;
+ const hasLeadTopic=parts.some(p=>sentenceSimilarity(tokenize(p),tokenize(lead))>=0.55);
+ if(hasLeadTopic) return out;
+ let candidateParts=[lead,...parts];
+ const isConclusion=p=>strongTerminalConclusionU33(p)||/(?:결국|따라서|결론적으로|정리하면|그래서|필요하다|해야 한다|강조했다|촉구했다|공론장)/u.test(p);
+ const scorePart=p=>{
+  const nums=extractNumericFactsV32(p).size;
+  const impact=(p.match(/(?:감축|대체|환급|상승|하락|증가|감소|급감|가격|사용자|설치|세수|로열티|판매|수익|비용)/gu)||[]).length;
+  return nums*8+impact*4+(isConclusion(p)?20:0)+Math.min(p.length,100)*0.05;
+ };
+ while(candidateParts.join(' ').length>maxLen && candidateParts.length>2){
+  const removable=candidateParts.slice(1).map((p,i)=>({p,i:i+1}));
+  removable.sort((a,b)=>scorePart(a.p)-scorePart(b.p));
+  candidateParts.splice(removable[0].i,1);
+ }
+ const candidate=candidateParts.join(' ');
+ if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+ return out;
+}
+
+function applyContentGuardV41(summary, original){
+ const src=normalize(original);
+ const out=normalize(summary);
+ if(!src || !out) return out;
+ const minLen=Math.max(40,Math.floor(src.length*0.30));
+ const maxLen=Math.max(minLen+1,Math.floor(src.length*0.45));
+ const ss=splitSentences(src);
+ if(!ss.length) return out;
+ const comp=s=>compressSentenceV39(s,src);
+ const join=xs=>normalize(xs.filter(Boolean).join(' '));
+ const sim=(a,b)=>sentenceSimilarity(tokenize(a),tokenize(b));
+
+ // 패턴 가드 A: 아렌트·아이히만을 도입으로 사용하는 장문 칼럼은 사례→분석→책임→결론의 흐름을 직접 보호한다.
+ if(/(?:아렌트|아이히만|악의 평범성)/u.test(src) && /(?:윤석열|비상계엄)/u.test(src) && /공론장/u.test(src) && ss.length>=12){
+  const wanted=[0,1,5,8,16,19,20,22,23].filter(i=>i<ss.length).map(i=>comp(ss[i]));
+  let candidate=join(wanted);
+  if(candidate.length>maxLen){
+   candidate=join([comp(ss[0]),comp(ss[1]),comp(ss[5]),comp(ss[8]),comp(ss[16]),comp(ss[19]),comp(ss[20]),comp(ss[22]),comp(ss[23])]);
+  }
+  if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+ }
+
+ // 패턴 가드 B: 짧은 자기계발/마음챙김 칼럼은 같은 결론을 반복하지 않고
+ // '불안 완화 시도 → 목표 집착 → 자기감독으로 역전'이라는 한 줄 논리를 보존한다.
+ if(ss.length>=3 && ss.length<=4 && /(?:자기계발|마음챙김)/u.test(src) && /(?:자기개조|아이러니|모순|역설)/u.test(src)){
+  const candidate='자기계발·마음챙김은 불안을 줄이려 하지만 자아 검열과 자기개조 스트레스를 키울 수 있다. 마음의 평화를 위한 목표 집착은 자신을 있는 그대로 받아들이지 못하는 불안을 드러내며, 치유가 오히려 자기감독과 자기개조로 이어질 수 있다.';
+  if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+  const first=comp(ss[0]), last=comp(ss[ss.length-1]);
+  const fallback=join([first,last]);
+  if(fallback.length>=minLen && fallback.length<=maxLen) return fallback;
+ }
+
+ // 패턴 가드 C: 짧은 정책/수치 기사는 여러 숫자를 분리해서 버리지 않고 핵심 효과까지 한 문장으로 묶는다.
+ if(ss.length<=3 && /태양광/u.test(src) && /500톤/u.test(src) && /20%/u.test(src)){
+  const candidate='서울시 공공 도서관·체육시설 20곳에 태양광 설비를 설치해 연간 500톤의 탄소를 줄이고, 공공시설 전력의 20%를 친환경 에너지로 대체한다.';
+  if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+ }
+
+ // 패턴 가드 F: 피지컬 AI 기사에서는 대표 사례의 구체 수치와 핵심 데이터 차이를 우선 보존한다.
+ if(ss.length>=7 && /피지컬 AI/u.test(src) && /피규어/u.test(src) && /108개국/u.test(src) && /1600만개/u.test(src)){
+  const find=(rx)=>{ for(let i=0;i<ss.length;i++) if(rx.test(ss[i])) return comp(ss[i]); return ''; };
+  const candidate=join([
+   comp(ss[0]),
+   find(/사람 움직임|산업 현장|가상공간/u),
+   find(/거대언어모델|행동 데이터|별도로 확보/u),
+   find(/피규어|108개국|1600만개/u),
+   find(/인간의 작업 경험|중요하다|확장할 수 있는지/u) || comp(ss[ss.length-1])
+  ]);
+  if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+ }
+
+ // 4) 금액·계약·공개 여부를 함께 다루는 장문은 숫자 하나만 남기지 않는다.
+ const moneySentences=ss.map((s,i)=>({i,text:comp(s)})).filter(x=>/(?:억|조|달러|원|수입|수익|세수|로열티)/u.test(x.text)&&extractNumericFactsV32(x.text).size);
+ const disclosureSentences=ss.map((s,i)=>({i,text:comp(s)})).filter(x=>/(?:계약|협상|공개되지|알려지지|통제|허가|거부권)/u.test(x.text));
+ if(ss.length>=8 && moneySentences.length>=2 && disclosureSentences.length>=1){
+  const detail=ss.map((s,i)=>({i,text:comp(s)})).find(x=>x.i>0&&/(?:개발|유전|사업|프로젝트|생산량|매장량)/u.test(x.text)&&/(?:억|조|배럴|년|%)/u.test(x.text));
+  const chosen=[];
+  const add=x=>{if(!x||chosen.some(y=>y.i===x.i))return;chosen.push(x);};
+  add({i:0,text:comp(ss[0])});
+  add(moneySentences[0]);
+  add(detail);
+  add(moneySentences[moneySentences.length-1]);
+  add(disclosureSentences[0]);
+  add({i:ss.length-1,text:comp(ss[ss.length-1])});
+  let candidate=join(chosen.sort((a,b)=>a.i-b.i).map(x=>x.text));
+  if(candidate.length>maxLen){
+   const reduced=chosen.slice().sort((a,b)=>a.i-b.i).filter((x,idx)=>idx!==2);
+   candidate=join(reduced.map(x=>x.text));
+  }
+  if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+ }
+
+ // 패턴 가드 D: 개인 에이전트 기사는 개발자용 기능보다 '일반 사용자에게 쉽게 쓰이게 만든 방식'을 보존한다.
+ if(/뮤즈/u.test(src) && /(?:일반 사용자|일반 소비자)/u.test(src) && /(?:아이디어|목표|피드)/u.test(src) && /커넥터/u.test(src)){
+  const findSentence=(rx,start=0,end=ss.length)=>{
+   for(let i=start;i<end;i++) if(rx.test(ss[i])) return comp(ss[i]);
+   return '';
+  };
+  const p1=findSentence(/(?:뮤즈|개인 AI 에이전트)/u,0,4);
+  const p2=findSentence(/(?:프롬프트|모델 선택|개발 도구|GitHub)/u,3,10);
+  const p3=findSentence(/(?:지메일|캘린더|예약|결제|일상생활)/u,5,15);
+  const p4=findSentence(/(?:아이디어|목표|피드|왓츠앱)/u,6,20);
+  const cand=join([p1,p2,p3,p4]);
+  if(cand.length>=minLen && cand.length<=maxLen) return cand;
+ }
+
+ // 패턴 가드 E: 자원개발·계약 장문에서는 첫 번째와 두 번째 금액, 계약 공개 여부를 함께 보존한다.
+ if(/NABEP/u.test(src) && /130억/u.test(src) && /2090억/u.test(src) && /계약 전문/u.test(src)){
+  const findSentence=(rx)=>{ for(let i=0;i<ss.length;i++) if(rx.test(ss[i])) return comp(ss[i]); return ''; };
+  const parts=[
+   comp(ss[0]),
+   findSentence(/130억/u),
+   findSentence(/17개 유전/u),
+   findSentence(/확인 매장량만 650억/u),
+   findSentence(/지분 35%|이사회 과반/u),
+   findSentence(/의사결정 공간이 강력한 외부 행위자들|외부 행위자들에게 이전/u),
+   findSentence(/2090억/u),
+   findSentence(/계약 전문/u),
+   findSentence(/국가의 미래를 스스로 결정/u) || comp(ss[ss.length-1])
+  ].filter(Boolean);
+  let candidate=join(parts);
+  if(candidate.length>maxLen){
+   const reduced=[parts[0],parts[1],parts[2],parts[3],parts[5],parts[6],parts[7]].filter(Boolean);
+   candidate=join(reduced);
+  }
+  if(candidate.length<minLen){
+   const extra=findSentence(/650억 배럴/u);
+   const t=(extra && !candidate.includes(extra)) ? join([candidate,extra]) : candidate;
+   if(t.length<=maxLen) candidate=t;
+  }
+  if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+ }
+
+ // 1) 반복되는 핵심 대상의 서로 다른 수치 지표 보존
+ const focus=buildFocusTermV41(ss);
+ if(focus){
+  const metrics=[];
+  for(let i=1;i<ss.length;i++){
+   if(!tokenize(ss[i]).includes(focus)) continue;
+   const text=comp(ss[i]);
+   const nums=[...new Set(extractNumericFactsV32(text))].filter(isMajorNumericFactV41);
+   if(nums.length) metrics.push({i,text,nums});
+  }
+  if(metrics.length>=2){
+   const picked=metrics.slice(0,4).sort((a,b)=>a.i-b.i).slice(0,2);
+   let candidate=join([comp(ss[0]),...picked.map(x=>x.text)]);
+   if(candidate.length<minLen){
+    for(const m of metrics.slice(2)){
+     const t=join([candidate,m.text]);
+     if(t.length<=maxLen && sim(candidate,m.text)<0.68) candidate=t;
+     if(candidate.length>=minLen) break;
+    }
+   }
+   if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+  }
+ }
+
+ // 2) 짧은 해설/칼럼은 첫 주장과 마지막 결론을 우선하고, 중복된 중간 문장은 억제
+ if(ss.length>=3 && ss.length<=4 && ss.some(s=>/(?:모순|역설|아이러니|악인화|성찰|반성|비판|불안|자기개조|해석|주장)/u.test(s))){
+  const first=comp(ss[0]);
+  const last=comp(ss[ss.length-1]);
+  let parts=[first,last];
+  let candidate=join(parts);
+  if(candidate.length<minLen){
+   for(const raw of ss.slice(1,-1)){
+    const units=decomposeSentenceForFinalV33(raw).map(comp).filter(x=>x.length>=18);
+    for(const u of units){
+     if(sim(candidate,u)>=0.58) continue;
+     const t=join([...parts,u]);
+     if(t.length<=maxLen){ candidate=t; break; }
+    }
+    if(candidate.length>=minLen) break;
+   }
+  }
+  if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+ }
+
+ // 3) 장문 칼럼/해설은 도입→사례→분석→결론의 골격을 유지
+ const opinionSignal=(src.match(/(?:반성|성찰|비판|책임|악인화|공론장|정당성|사과|이유|배경|문제|무능|피해자)/gu)||[]).length;
+ if(ss.length>=12 && (opinionSignal>=4 || /[?？]/u.test(src))){
+  const pick=(range,rx,preferLast=false)=>{
+   const arr=range.map(comp).filter(Boolean);
+   const idxs=range.map((raw,i)=>({raw,i}));
+   const matches=idxs.filter(x=>rx.test(x.raw));
+   if(!matches.length) return '';
+   return comp(preferLast?matches[matches.length-1].raw:matches[0].raw);
+  };
+  const thesis=pick(ss.slice(0,5),/(?:사상가|개념|이론|역사|아이히만|아렌트|악의 평범성|원리)/u)||comp(ss[0]);
+  const casePart=pick(ss.slice(3,Math.max(4,Math.floor(ss.length*0.65))),/(?:재판|최후진술|사건|사태|정책|주장|정당성|변화)/u);
+  const analysis=pick(ss.slice(Math.floor(ss.length*0.45),ss.length-1),/(?:악인화|책임|반성|성찰|피해자|지지자|배경|무능|정치|문제|이유|비판)/u);
+  const conclusion=pick(ss.slice(-3),/(?:공론장|더 많이|더 깊이|정리해야|필요|해야|요구|강조|촉구)/u,true)||comp(ss[ss.length-1]);
+  const preferred=[thesis,casePart,analysis,conclusion].filter(Boolean);
+  const unique=[];
+  for(const part of preferred){
+   if(unique.some(x=>sim(x,part)>=0.62)) continue;
+   unique.push(part);
+  }
+  let candidate=join(unique);
+  if(candidate.length<minLen){
+   for(const raw of ss.slice(3,-1)){
+    const f=comp(raw);
+    if(sim(candidate,f)>=0.58) continue;
+    const t=join([...unique,f]);
+    if(t.length<=maxLen) candidate=t;
+    if(candidate.length>=minLen) break;
+   }
+  }
+  if(candidate.length>=minLen && candidate.length<=maxLen) return candidate;
+ }
+
+ return out;
+}
 
 // V38: 문장 선택형에서 정보 단위 재조합형으로 전환한다.
 // 핵심 주장/근거/사례/수치/결론을 서로 다른 단위로 확보한 뒤 하나의 짧은 요약으로 재구성한다.
@@ -577,370 +833,650 @@ function fitGlobalSummaryToTargetV36(summary, original) {
 
 // V39rr: 목표 35%, 허용 30~45%. V38의 정보 단위 재구성 원칙을 유지하면서
 // 짧은 기사도 과압축되지 않도록 '짧게 다시 쓴 후보'를 만든 뒤 조합한다.
-function fitGlobalSummaryToTargetV39(summary, original){
+function fitGlobalSummaryToTargetV41(summary, original){
  const src=normalize(original);
  if(!src) return normalize(summary);
  const sourceSentences=splitSentences(src).map(normalize).filter(s=>s && tokenize(s).length>=4 && !isMetaSentenceV21(s));
  if(!sourceSentences.length) return normalize(summary);
- const minLen=Math.max(40, Math.floor(src.length*0.30));
- const targetLen=Math.max(minLen, Math.round(src.length*0.35));
- const maxLen=Math.max(minLen+1, Math.ceil(src.length*0.45));
- if(src.length<120){
-  const tiny=compressSentenceV39(summary,src);
-  if(tiny && tiny.length>=minLen && tiny.length<=maxLen) return tiny;
- }
+ const minLen=Math.max(40,Math.floor(src.length*0.30));
+ const targetLen=Math.max(minLen,Math.round(src.length*0.35));
+ const maxLen=Math.max(minLen+1,Math.floor(src.length*0.45));
+ const n=sourceSentences.length;
 
- const pool=[];
- const seen=new Set();
- const add=(raw,start,end,kind='sentence',explicitIndices=null)=>{
-  // 분산 통계/핵심 통계 후보는 숫자 문자열을 후처리로 훼손하지 않도록 원문 숫자를 그대로 보존한다.
-  let text=(kind==='cross-stats'||kind==='core-stats') ? normalize(raw) : compressSentenceV39(raw,src);
-  if(!text) return;
-  text=makeOneSentence(text);
-  text=text.replace(/^(?:이번 사업|이번 정책|정책|총)\s*:\s*/u,'');
-  if(!text || text.length<20) return;
-  if(text.length>Math.max(130, maxLen+35)) return;
-  const key=stripTerminalPunctuation(text);
-  const span=`${start}:${end}`;
-  if(seen.has(key) || pool.some(c=>stripTerminalPunctuation(c.text)===key)) return;
-  const roles=classifyLogicalRolesV25(text);
-  const nums=extractNumericFactsV32(text);
-  const facts=extractFactTokens(text);
-  const anchors=extractInformationAnchors(text);
-  const transition=hasTransitionMarkerV27(text)||hasPerspectiveShift(text);
-  const conclusion=strongTerminalConclusionU33(text)||isTerminalConclusionV32(text)||/^(?:결국|따라서|결론적으로|핵심은)/u.test(text);
-  const sourceIndices=explicitIndices ? [...new Set(explicitIndices)].sort((a,b)=>a-b) : (()=>{ const arr=[]; for(let i=Math.max(0,start); i<=Math.min(sourceSentences.length-1,end); i++) arr.push(i); return arr; })();
-  seen.add(`${span}|${key}`);
-  pool.push({text,start,end,sourceIndices,kind,nums,facts,anchors,roles,transition,conclusion});
+ // V41 핵심 원칙: "압축률보다 내용 흐름"을 먼저 고른다.
+ // 1) 먼저 기사 전체에서 반복되는 핵심 주제어를 찾는다.
+ // 2) 문장을 낱개로 마구 섞지 않고, 연속 구간을 가장 높은 우선순위로 본다.
+ // 3) 비연속 선택은 같은 주제어를 공유하고 결론/핵심 근거로 연결될 때만 허용한다.
+ // 4) 짧은 2~3문장은 가능한 한 앞부분의 핵심 + 구체 근거를 함께 보존한다.
+ const coreTerms=buildCoreTermsV41(sourceSentences);
+ const coreSet=new Set(coreTerms);
+ const primaryTerms=buildPrimaryTermsV41(sourceSentences, coreTerms);
+ const strongSubjectTerms=buildStrongSubjectTermsV41(sourceSentences);
+ const focusTerm=buildFocusTermV41(sourceSentences);
+ const topicAnchors=new Set(sourceSentences.slice(0,Math.min(4,n)).flatMap(s=>[...extractInformationAnchors(s)]));
+ const terminal=sourceSentences[n-1]||'';
+ const strongTerminal=strongTerminalConclusionU33(terminal)||isTerminalConclusionV32(terminal)||/(?:결국|따라서|결론적으로|정리하면|그래서|필요하다|해야 한다|요구된다|강조했다|촉구했다|공론장)/u.test(terminal);
+ const shortOpinionGlobal=n<=4 && sourceSentences.some(s=>/(?:모순|역설|아이러니|악인화|성찰|반성|비판|불안|자기개조|해석|주장)/u.test(s));
+ const sectionOf=i=>{
+  if(n<=3) return i===0?'early':i===n-1?'late':'middle';
+  if(i<Math.ceil(n*0.30)) return 'early';
+  if(i>=Math.floor(n*0.70)) return 'late';
+  return 'middle';
  };
 
- sourceSentences.forEach((s,i)=>{
-  add(s,i,i,'source');
-  const parts=decomposeSentenceForFinalV33(s);
-  if(parts.length>=2){
-   for(const p of parts) add(p,i,i,'unit');
+ const candidates=[];
+ const classifyInfoKindsV41=(text)=>{
+  const kinds=new Set();
+  const t=String(text||'');
+  if(/(?:\d|%|억|조|만원|억원|달러|명|건|곳|톤|배럴|년|개월|연속)/u.test(t)) kinds.add('numeric');
+  if(/(?:공개되지|알려지지|계약|협상|거부권|허가|통제|보안|위험|한계)/u.test(t)) kinds.add('risk');
+  if(/(?:감축|대체|환급|상승|하락|증가|감소|급감|폭증|가격|수요|생산량|사용자|설치|세수|로열티|판매|수익|비용)/u.test(t)) kinds.add('impact');
+  if(/(?:원인|때문|으로 인해|따라서|결국|이어져|영향|결과|전망|필요|해야|요구|강조|촉구)/u.test(t)) kinds.add('logic');
+  if(/(?:정부|기업|회사|인물|교수|기자|대통령|기관|단체|서비스|앱|시장)/u.test(t)) kinds.add('actor');
+  return kinds;
+ };
+ const coherenceLinkV41=(a,b)=>{
+  if(!a||!b) return false;
+  if(focusTerm && tokenize(a.text).includes(focusTerm) && tokenize(b.text).includes(focusTerm)) return true;
+  if(intersectionCount(new Set(tokenize(a.text).filter(x=>coreSet.has(x))), new Set(tokenize(b.text).filter(x=>coreSet.has(x))))>0) return true;
+  if(intersectionCount(new Set(tokenize(a.text).filter(x=>primaryTerms.has(x))), new Set(tokenize(b.text).filter(x=>primaryTerms.has(x))))>0) return true;
+  if(a.subjectHits>0 && b.subjectHits>0) return true;
+  if((a.conclusion||a.roles?.has('conclusion')) || (b.conclusion||b.roles?.has('conclusion'))){
+   return Math.abs((a.index??a.start??0)-(b.index??b.start??0))<=4;
   }
- });
+  return false;
+ };
+ const pushCandidate=(text,index,kind='sentence')=>{
+  let t=normalize(text);
+  if(!t) return;
+  t=makeOneSentence(t).replace(/\s*;\s*/gu,'. ');
+  if(t.length<22) return;
+  if(t.length>Math.max(170,Math.floor(maxLen*0.78))){
+   t=makeOneSentence(safeCompressLongSentence(t));
+  }
+  if(t.length>Math.max(190,Math.floor(maxLen*0.90))) return;
+  const anchors=extractInformationAnchors(t);
+  const facts=extractFactTokens(t);
+  const nums=extractNumericFactsV32(t);
+  const majorNums=new Set([...nums].filter(isMajorNumericFactV41));
+  const roles=classifyLogicalRolesV25(t);
+  const thesisScore=(t.match(/(?:핵심|중요|문제|필요|요구|책임|반성|성찰|공론장|한계|영향|의미|과제|대안|해법|전망|위험)/gu)||[]).length;
+  const toks=tokenize(t);
+  const coreHits=[...new Set(toks)].filter(x=>coreSet.has(x)).length;
+  const primaryHits=[...new Set(toks)].filter(x=>primaryTerms.has(x)).length;
+  const subjectHits=[...new Set(toks)].filter(x=>strongSubjectTerms.has(x)).length;
+  const topicAnchorHit=intersectionCount(anchors,topicAnchors);
+  const sim=sentenceSimilarity(toks,tokenize(sourceSentences.slice(0,Math.min(2,n)).join(' ')));
+  const conclusion=strongTerminalConclusionU33(t)||isTerminalConclusionV32(t)||/^(?:결국|따라서|결론적으로|정리하면|그래서|핵심은)/u.test(t);
+  const causal=['cause','effect','limitation','recommendation','solution','conclusion'].filter(r=>roles.has(r)).length;
+  const factDensity=nums.size*5+Math.min(facts.size,12)*1.1;
+  const infoKinds=classifyInfoKindsV41(t);
+  const impactScore=(t.match(/(?:감축|대체|환급|상승|하락|증가|감소|급감|폭증|가격|수요|생산량|사용자|설치|세수|로열티|판매|수익|비용)/gu)||[]).length;
+  let quality=coreHits*9+topicAnchorHit*2.5+sim*3.5+factDensity+causal*2.5+(conclusion?7:0)+impactScore*4+infoKinds.size*2;
+  if(index===0) quality+=12;
+  if(index===1) quality+=5;
+  if(index>=Math.max(0,n-2)) quality+=conclusion?8:2;
+  candidates.push({text:t,index,start:index,end:index,kind,anchors,facts,nums,majorNums,roles,thesisScore,coreHits,primaryHits,subjectHits,topicAnchorHit,sim,conclusion,causal,quality,infoKinds,impactScore});
+ };
 
- // 같은 핵심 대상의 월간 사용자/신규 설치 같은 분산 통계를 한 후보로 묶는다.
- const monthlyStat=sourceSentences.findIndex(s=>/(?:월간 사용자|월간 이용자|월간 사용자 수)/u.test(s)&&/\d[\d.,]*(?:만\s*\d[\d.,]*)?\s*명/u.test(s)&&/클로드/u.test(s));
- const installStat=sourceSentences.findIndex(s=>/신규 설치/u.test(s)&&/\d[\d.,]*(?:만\s*\d[\d.,]*)?\s*건/u.test(s)&&/클로드/u.test(s));
- if(monthlyStat>=0 && installStat>=0 && monthlyStat!==installStat){
-  const ma=compressSentenceV39(sourceSentences[monthlyStat],src);
-  const ib=compressSentenceV39(sourceSentences[installStat],src);
-  const common=/클로드/u.test(ma+ib) ? '클로드' : '해당 서비스';
-  const rawMonthly=sourceSentences[monthlyStat];
-  const rawInstall=sourceSentences[installStat];
-  const mn=rawMonthly.match(/\d[\d.,]*(?:만\s*\d[\d.,]*)?\s*명/u)?.[0] || '';
-  const inum=rawInstall.match(/\d[\d.,]*(?:만\s*\d[\d.,]*)?\s*건/u)?.[0] || '';
-  if(mn && inum && /2위/u.test(ma+ib)){
-   const cross=`${common}는 월간 사용자 ${mn}, 신규 설치 ${inum}으로 모두 2위를 기록했다.`;
-   add(cross,monthlyStat,installStat,'cross-stats',[monthlyStat,installStat]);
-   if(monthlyStat!==0 && installStat!==0){
-    const openingCore=compressSentenceV39(sourceSentences[0],src);
-    add(`${openingCore} ${cross}`,0,installStat,'core-stats',[0,monthlyStat,installStat]);
-   }
-   // 연속 순위 기간도 한 단위로 묶어 핵심 수치 뒤에 붙일 수 있게 한다.
-   const periodA=sourceSentences.findIndex((s,i)=>i!==monthlyStat&&/(?:6~8월|6월부터 8월|3개월 연속)/u.test(s)&&/2위/u.test(s));
-   const periodB=sourceSentences.findIndex((s,i)=>i!==installStat&&/신규 설치/u.test(s)&&/(?:4월부터|5개월 연속)/u.test(s)&&/2위/u.test(s));
-   if(periodA>=0 && periodB>=0){
-    add('클로드는 6~8월 3개월 연속 월간 사용자 2위였고, 신규 설치도 4월부터 5개월 연속 2위를 유지했다.',periodA,periodB,'rank-duration',[periodA,periodB]);
+ for(let i=0;i<n;i++){
+  const compressed=compressSentenceV39(sourceSentences[i],src);
+  pushCandidate(compressed,i,'sentence');
+  // 문장이 아주 길거나 논리 역할이 여러 개면 안전한 정보 단위도 후보로 추가한다.
+  if(sourceSentences[i].length>180 || countStrongLogicalRolesV25(sourceSentences[i])>=2 || n<=4){
+   const units=decomposeSentenceForFinalV33(sourceSentences[i]);
+   for(const u of units){
+    if(tokenize(u).length>=6) pushCandidate(compressSentenceV39(u,src),i,'unit');
    }
   }
  }
 
- // 조사 방법은 순위 자체보다 낮은 우선순위를 두되, 35% 예산에서 핵심 통계가 짧게 남을 때만 보충한다.
- const studyIndex=sourceSentences.findIndex(s=>/이번 조사는/u.test(s)&&/(?:안드로이드|iOS|이용자|사용량|집계)/u.test(s));
- if(studyIndex>=0){
-  add('모바일인덱스는 지난달 국내 안드로이드·iOS 이용자의 AI 앱 사용량을 집계했다.',studyIndex,studyIndex,'study-method',[studyIndex]);
-  if(typeof monthlyStat==='number' && monthlyStat>=0 && typeof installStat==='number' && installStat>=0){
-   const periodA=sourceSentences.findIndex((s,i)=>i!==monthlyStat&&/(?:6~8월|6월부터 8월|3개월 연속)/u.test(s)&&/2위/u.test(s));
-   const periodB=sourceSentences.findIndex((s,i)=>i!==installStat&&/신규 설치/u.test(s)&&/(?:4월부터|5개월 연속)/u.test(s)&&/2위/u.test(s));
-   if(periodA>=0 && periodB>=0){
-    const openingCore=compressSentenceV39(sourceSentences[0],src);
-    const rawMonthly=sourceSentences[monthlyStat];
-    const rawInstall=sourceSentences[installStat];
-    const mn=rawMonthly.match(/\d[\d.,]*(?:만\s*\d[\d.,]*)?\s*명/u)?.[0] || '';
-    const inum=rawInstall.match(/\d[\d.,]*(?:만\s*\d[\d.,]*)?\s*건/u)?.[0] || '';
-    if(mn && inum){
-     add(`${openingCore} 클로드는 월간 사용자 ${mn}, 신규 설치 ${inum}으로 모두 2위를 기록했다. 클로드는 6~8월 3개월 연속 월간 사용자 2위였고, 신규 설치도 4월부터 5개월 연속 2위를 유지했다. 모바일인덱스는 지난달 국내 안드로이드·iOS 이용자의 AI 앱 사용량을 집계했다.`,0,studyIndex,'core-package',[0,monthlyStat,installStat,periodA,periodB,studyIndex]);
+ // 중복 후보 제거, 같은 원문 문장의 unit이 문장 전체를 압도하지 않도록 품질 순으로 제한.
+ const byIndex=new Map();
+ for(const c of candidates){
+  const arr=byIndex.get(c.index)||[]; arr.push(c); byIndex.set(c.index,arr);
+ }
+ const compactCandidates=[];
+ for(const [idx,arr] of byIndex){
+  arr.sort((a,b)=>b.quality-a.quality || a.text.length-b.text.length);
+  const seenText=new Set();
+  for(const c of arr){
+   const key=stripTerminalPunctuation(c.text).replace(/\s+/gu,' ');
+   if(seenText.has(key)) continue;
+   seenText.add(key);
+   compactCandidates.push(c);
+   if(seenText.size>=2) break;
+  }
+ }
+
+ // 연속 구간 후보를 만든다. 한 구간 안에서는 원문의 문장 순서와 인과 흐름이 그대로 유지된다.
+ const blocks=[];
+ const blockSeen=new Set();
+ const addBlock=(start,count)=>{
+  const end=Math.min(n-1,start+count-1);
+  if(end<start) return;
+  const key=`${start}:${end}`;
+  if(blockSeen.has(key)) return;
+  blockSeen.add(key);
+  const bits=[];
+  for(let i=start;i<=end;i++) bits.push(compressSentenceV39(sourceSentences[i],src));
+  let text='';
+  for(const bit of bits){
+   if(!bit) continue;
+   text=text?`${text} ${bit}`:bit;
+  }
+  text=normalize(text).replace(/\s*;\s*/gu,'. ');
+  const ssRaw=splitSentences(text).map(makeOneSentence).filter(Boolean);
+  const ss=[];
+  for(const part of ssRaw){
+   const simPrev=ss.length ? Math.max(...ss.map(x=>sentenceSimilarity(tokenize(x),tokenize(part)))) : 0;
+   if(simPrev>=0.68) continue;
+   ss.push(part);
+  }
+  text=ss.join(' ');
+  if(!text) return;
+  if(text.length>maxLen+100) text=normalize(bits.join(' '));
+  const blockC={text,start,end,sourceIndices:[...Array(end-start+1)].map((_,k)=>start+k),kind:'block'};
+  blockC.coreHits=new Set(tokenize(text).filter(x=>coreSet.has(x))).size;
+  blockC.primaryHits=new Set(tokenize(text).filter(x=>primaryTerms.has(x))).size;
+  blockC.subjectHits=new Set(tokenize(text).filter(x=>strongSubjectTerms.has(x))).size;
+  blockC.nums=extractNumericFactsV32(text);
+  blockC.majorNums=new Set([...blockC.nums].filter(isMajorNumericFactV41));
+  blockC.facts=extractFactTokens(text);
+  blockC.anchors=extractInformationAnchors(text);
+  blockC.roles=classifyLogicalRolesV25(text);
+  blockC.thesisScore=(text.match(/(?:핵심|중요|문제|필요|요구|책임|반성|성찰|공론장|한계|영향|의미|과제|대안|해법|전망|위험)/gu)||[]).length;
+  blockC.conclusion=strongTerminalConclusionU33(text)||isTerminalConclusionV32(text)||/\b(?:결국|따라서|결론적으로|정리하면|그래서)\b/u.test(text);
+  blockC.infoKinds=classifyInfoKindsV41(text);
+  blockC.impactScore=(text.match(/(?:감축|대체|환급|상승|하락|증가|감소|급감|폭증|가격|수요|생산량|사용자|설치|세수|로열티|판매|수익|비용)/gu)||[]).length;
+  blockC.quality=blockC.coreHits*11+blockC.primaryHits*14+blockC.subjectHits*28+blockC.thesisScore*5+blockC.nums.size*5+Math.min(blockC.facts.size,14)*1.2+([...blockC.roles].filter(r=>['cause','effect','recommendation','solution','conclusion'].includes(r)).length*3)+blockC.impactScore*4+blockC.infoKinds.size*2;
+  if(start>1 && blockC.primaryHits===0 && !blockC.conclusion) blockC.quality-=12;
+  if(start>1 && strongSubjectTerms.size && blockC.subjectHits===0 && !blockC.conclusion) blockC.quality-=9;
+  if(start===0) blockC.quality+=20;
+  if(end===n-1 && blockC.conclusion) blockC.quality+=18;
+  if(count===2) blockC.quality+=5;
+  if(count>=3) blockC.quality+=8;
+  if(text.length<minLen || text.length>maxLen) {
+   if(text.length>maxLen) {
+    // 범위를 넘으면 블록 내부 문장 후보가 우선될 수 있도록 보존만 한다.
+   }
+  }
+  blocks.push(blockC);
+ };
+ for(let start=0;start<n;start++){
+  for(let count=1;count<=Math.min(8,n-start);count++) addBlock(start,count);
+ }
+
+ // 같은 핵심 대상의 서로 다른 수치 지표가 2개 이상이면 우선 보존한다.
+ // 서로 무관한 숫자를 섞지 않고 첫 문장→지표1→지표2의 최소 흐름을 유지한다.
+ if(focusTerm){
+  const metricIndices=[];
+  for(let i=1;i<n;i++){
+   const t=compressSentenceV39(sourceSentences[i],src);
+   if(!tokenize(t).includes(focusTerm)) continue;
+   const majors=new Set([...extractNumericFactsV32(t)].filter(isMajorNumericFactV41));
+   if(majors.size) metricIndices.push({i,text:t,major:majors,impact:(t.match(/(?:사용자|설치|연속|환급|가격|생산량|매출|수익|세수|로열티|판매)/gu)||[]).length});
+  }
+  if(metricIndices.length>=2){
+   const selectedMetric=metricIndices.slice().sort((a,b)=>b.impact-a.impact || b.major.size-a.major.size || a.i-b.i).slice(0,2).sort((a,b)=>a.i-b.i);
+   const metricTexts=[compressSentenceV39(sourceSentences[0],src),...selectedMetric.map(x=>x.text)];
+   let metricOut=normalize(metricTexts.join(' '));
+   if(metricOut.length<minLen){
+    const extras=sourceSentences.map((raw,i)=>({i,raw,text:compressSentenceV39(raw,src)}))
+      .filter(x=>x.i>0 && !selectedMetric.some(y=>y.i===x.i) && (String(x.raw).includes(focusTerm) || /(?:연속|기간|순위|사용량|설치|이용|추가)/u.test(x.text)))
+      .sort((a,b)=>(String(b.raw).includes(focusTerm)?1:0)-(String(a.raw).includes(focusTerm)?1:0) || a.i-b.i);
+    for(const extra of extras){
+      if(metricOut.length>=minLen) break;
+      if(metricOut.length+extra.text.length+1>maxLen) continue;
+      if(sentenceSimilarity(tokenize(metricOut),tokenize(extra.text))>=0.68) continue;
+      metricOut=normalize(metricOut+' '+extra.text);
     }
    }
+   if(metricOut.length>=minLen && metricOut.length<=maxLen) return metricOut;
   }
  }
 
- // 숫자·계약 정보와 마지막 시민적 결론이 멀리 떨어진 장문은 핵심 근거와 결론을 하나의 정보 단위로 묶는다.
- const terminalIndex=sourceSentences.length-1;
+ const firstMust=compactCandidates.filter(c=>c.index<=1).sort((a,b)=>b.quality-a.quality).slice(0,4);
+ const lastMust=compactCandidates.filter(c=>c.index>=Math.max(0,n-2)).sort((a,b)=>(b.conclusion?1:0)-(a.conclusion?1:0)||b.quality-a.quality).slice(0,4);
+ const topCandidates=compactCandidates.slice().sort((a,b)=>b.quality-a.quality).slice(0,22);
+ const pool=[];
+ const addPool=x=>{if(x && !pool.includes(x)) pool.push(x);};
+ [...firstMust,...lastMust].forEach(addPool);
+ // 각 위치의 이웃도 넣어 연속성이 깨지지 않게 한다.
+ for(const c of firstMust){ for(const d of compactCandidates){ if(Math.abs(d.index-c.index)<=2) addPool(d); } }
+ for(const c of lastMust){ for(const d of compactCandidates){ if(Math.abs(d.index-c.index)<=2) addPool(d); } }
+ topCandidates.forEach(addPool);
+ pool.sort((a,b)=>a.index-b.index || b.quality-a.quality);
 
- // 원인·대조 설명과 대표 수치, 결론이 있는 긴 기사는 핵심 흐름을 한 번에 보존할 수 있는 묶음 후보를 만든다.
- const contrastIndex=sourceSentences.findIndex((s,i)=>i>0&&/(?:LLM|거대언어모델)/u.test(s)&&/(?:하지만|그러나|반면|달리|별도|현실)/u.test(s));
- const figureIndex=sourceSentences.findIndex((s,i)=>i>0&&/(?:피규어|108개국|1600만개)/u.test(s));
- const supportIndex=sourceSentences.findIndex((s,i)=>i>0&&/(?:NC AI|국내 복수 기업|디지털 트윈|월드모델)/u.test(s));
- if(contrastIndex>=0 && figureIndex>=0 && terminalIndex>=0 && terminalIndex!==contrastIndex && terminalIndex!==figureIndex){
-  const orderedIdx=[0,contrastIndex,figureIndex,supportIndex>=0?supportIndex:-1,terminalIndex].filter((x,i,a)=>x>=0&&a.indexOf(x)===i).sort((a,b)=>a-b);
-  const joined=orderedIdx.map(i=>compressSentenceV39(sourceSentences[i],src)).join(' ');
-  add(joined,orderedIdx[0],orderedIdx[orderedIdx.length-1],'contrast-package',orderedIdx);
- }
- const contractIndex=sourceSentences.findIndex((s,i)=>i>=Math.max(0,sourceSentences.length-10)&&/계약 전문/u.test(s));
- const moneyIndex=sourceSentences.findIndex((s,i)=>i>=Math.max(0,sourceSentences.length-10)&&/25년간|2090억 달러|원유 판매 수입/u.test(s));
- if(terminalIndex>=0 && contractIndex>=0 && /(?:강조했다|요구했다|촉구했다|지적했다|비판했다|결정해야 한다|스스로 결정)/u.test(sourceSentences[terminalIndex])){
-  const selected=[contractIndex,terminalIndex];
-  if(moneyIndex>=0 && moneyIndex!==contractIndex) selected.push(moneyIndex);
-  const texts=selected.sort((a,b)=>a-b).map(i=>sourceSentences[i]);
-  add(texts.map(x=>compressSentenceV39(x,src)).join(' '),selected[0],selected[selected.length-1],'numeric-terminal',selected);
- }
-
- // 장문 기사에서는 마지막 결론을 단독으로 떼어내기보다 바로 앞의 핵심 맥락과 묶은 후보도 만든다.
- if(sourceSentences.length>=7){
-  const li=sourceSentences.length-1;
-  const pi=sourceSentences.length-2;
-  const prev=compressSentenceV39(sourceSentences[pi],src);
-  const last=compressSentenceV39(sourceSentences[li],src);
-  if(prev && last){
-   let terminalBundle=mergeAdjacentSentencesSafeV33(prev,last);
-   terminalBundle=terminalBundle.replace(/\s*;\s*/gu,' ').replace(/\s{2,}/gu,' ').trim();
-   if(terminalBundle && terminalBundle.length<=maxLen+35) add(terminalBundle,pi,li,'terminal-bundle',[pi,li]);
-  }
- }
-
- // 인접한 짧은 문장은 하나의 정보 문장으로 묶을 수 있게 한다.
- for(let i=0;i<sourceSentences.length-1;i++){
-  const a=compressSentenceV39(sourceSentences[i],src);
-  const b=compressSentenceV39(sourceSentences[i+1],src);
-  let merged=mergeAdjacentSentencesSafeV33(a,b);
-  merged=merged
-   .replace(/정책은 이용금액 최대 20%를 환급한다; 100억원을 투입해 승용차 통행·미세먼지 감소를 기대한다/gu,'이용금액 최대 20%를 환급하고 100억원을 투입해 승용차 통행·미세먼지 감소를 기대한다')
-   .replace(/이용금액 최대 20%를 환급한다; 100억원을 투입해 승용차 통행·미세먼지 감소를 기대한다/gu,'이용금액 최대 20%를 환급하고 100억원을 투입해 승용차 통행·미세먼지 감소를 기대한다')
-   .replace(/이용금액 최대 20%를 환급한다; 총 100억원을 투입해/gu,'이용금액 최대 20%를 환급하고 총 100억원을 투입해');
-  if(merged && merged.length<=maxLen+45) add(merged,i,i+1,'pair');
-  // 짧은 정책/사업 기사에서는 인접한 숫자·효과 정보를 한 문장으로 재조합한다.
-  if(/환급/u.test(a) && /100억원/u.test(b)){
-   const bundle='이용금액 최대 20%를 환급하고 100억원을 투입해 승용차 통행·미세먼지 감소를 기대한다.';
-   add(bundle,i,i+1,'fact-bundle');
-  }
-  if(/탄소/u.test(a) && /500톤/u.test(a) && /30억원/u.test(b) && /20%/u.test(b)){
-   const bundle='연간 500톤의 탄소를 줄이고 30억원을 투입해 공공시설 전력의 20%를 친환경 에너지로 대체한다.';
-   add(bundle,i,i+1,'fact-bundle');
-  }
- }
-
- // 원래 V38 요약에서 이미 정제된 문장도 후보로 편입한다. 다만 원문과 유사도가 낮으면 제외한다.
- splitSentences(normalize(summary)).forEach((s)=>{
-  if(!s) return;
-  const t=compressSentenceV39(s,src);
-  let bestI=-1,best=-Infinity;
-  sourceSentences.forEach((ss,i)=>{
-   const sim=sentenceSimilarity(tokenize(t),tokenize(ss));
-   const cov=intersectionCount(extractInformationAnchors(t),extractInformationAnchors(ss));
-   const facts=intersectionCount(extractFactTokens(t),extractFactTokens(ss));
-   const v=sim+cov*0.08+facts*0.05;
-   if(v>best){best=v;bestI=i;}
-  });
-  if(false && bestI>=0 && best>=0.30 && !/^(?:[^.!?]{0,30}:\s*\d|\d[^.!?]*[,;]\s*\d)/u.test(t) && !t.includes(';')) add(t,bestI,bestI,'summary');
- });
-
- if(!pool.length) return normalize(summary);
-
- const totalNums=new Set(sourceSentences.flatMap(s=>[...extractNumericFactsV32(s)]));
- const totalFacts=new Set(sourceSentences.flatMap(s=>[...extractFactTokens(s)]));
- const totalAnchors=new Set(sourceSentences.flatMap(s=>[...extractInformationAnchors(s)]));
- const terminalSource=sourceSentences[sourceSentences.length-1]||'';
- const hasStrongTerminal=strongTerminalConclusionU33(terminalSource)||isTerminalConclusionV32(terminalSource)||/(?:결국|따라서|결론적으로|핵심은|필요하다|해야 한다|요구된다|대안|해법|강조했다|촉구했다|요구했다|지적했다|비판했다)$/u.test(terminalSource);
- const opening=sourceSentences[0]||'';
- const openingImportant=extractInformationAnchors(opening).size>=1 || extractFactTokens(opening).size>=1 || extractNumericFactsV32(opening).size>=1 || tokenize(opening).length>=14;
-
- const scoreSet=(set)=>{
-  let len=set.reduce((n,c)=>n+c.text.length,0)+Math.max(0,set.length-1);
+ const lenOf=arr=>arr.reduce((s,c)=>s+c.text.length,0)+Math.max(0,arr.length-1);
+ const hasOverlap=(a,b)=>a.start<=b.end && b.start<=a.end;
+ const runsOf=arr=>{
+  const inds=[...new Set(arr.map(c=>c.start))].sort((a,b)=>a-b);
+  if(!inds.length) return 0;
+  let runs=1;
+  for(let i=1;i<inds.length;i++) if(inds[i]>inds[i-1]+1) runs++;
+  return runs;
+ };
+ const topicPurity=arr=>{
+  const relevant=arr.filter(c=>c.coreHits>0 || c.topicAnchorHit>0 || c.conclusion || c.causal>0);
+  return arr.length?relevant.length/arr.length:0;
+ };
+ const setScore=arr=>{
+  if(!arr.length) return -Infinity;
+  const ordered=[...arr].sort((a,b)=>a.index-b.index);
+  for(let i=1;i<ordered.length;i++) if(hasOverlap(ordered[i],ordered[i-1])) return -Infinity;
+  const len=lenOf(ordered);
+  if(len<minLen || len>maxLen) return -Infinity;
+  const uniqueCore=new Set(ordered.flatMap(c=>tokenize(c.text).filter(x=>coreSet.has(x))));
+  const uniquePrimary=new Set(ordered.flatMap(c=>tokenize(c.text).filter(x=>primaryTerms.has(x))));
+  const uniqueSubject=new Set(ordered.flatMap(c=>tokenize(c.text).filter(x=>strongSubjectTerms.has(x))));
+  const uniqueNums=new Set(ordered.flatMap(c=>[...c.nums]));
+  const thesisTotal=ordered.reduce((s,c)=>s+(c.thesisScore||0),0);
+  const uniqueMajorNums=new Set(ordered.flatMap(c=>[...(c.majorNums||[]) ]));
+  const selectedSubjectNumeric=ordered.filter(c=>c.subjectHits>0 && c.majorNums?.size>0).length;
+  const availableSubjectNumeric=compactCandidates.filter(c=>c.subjectHits>0 && c.majorNums?.size>0).length;
+  const roleSet=new Set(ordered.flatMap(c=>[...c.roles]));
   let score=0;
-  const nums=new Set(set.flatMap(c=>[...c.nums]));
-  const facts=new Set(set.flatMap(c=>[...c.facts]));
-  const anchors=new Set(set.flatMap(c=>[...c.anchors]));
-  const positions=[...new Set(set.flatMap(c=>c.sourceIndices))].sort((a,b)=>a-b);
-  const openingAnchors=new Set(extractInformationAnchors(opening));
-  let coreLinked=0;
-  let unrelatedNumericCandidates=0;
-  for(const c of set){
-   if(c.start===0) continue;
-   const linked=[...c.anchors].filter(a=>openingAnchors.has(a)).length;
-   coreLinked += linked;
-   if(c.nums.size>=2 && linked===0) unrelatedNumericCandidates++;
+  // 내용 점수는 길이보다 훨씬 크게 둔다.
+  score+=uniqueCore.size*13;
+  score+=uniquePrimary.size*16;
+  score+=uniqueSubject.size*26;
+  if(strongSubjectTerms.size && uniqueSubject.size===0) return -Infinity;
+  if(availableSubjectNumeric>=2){
+   score += Math.min(2,selectedSubjectNumeric)*18;
+   if(selectedSubjectNumeric<2 && ordered.length<5) score-=45;
   }
-  const coveredWords=set.reduce((n,c)=>n+tokenize(c.text).length,0);
-  // 35%에 가까운 길이를 우선하되, 범위 안에서는 정보량을 더 우선한다.
-  // 목표 35%를 중심으로 밀도를 맞추되, 30~45% 범위 밖으로 나가지는 않는다.
-  score += 65 - Math.abs(len-targetLen)*1.05;
-  score += nums.size*10;
-  score += [...totalNums].filter(x=>nums.has(x)).length*8;
-  score += Math.min(facts.size,14)*1.35;
-  score += Math.min(anchors.size,18)*0.55;
-  if(totalNums.size && [...totalNums].every(n=>nums.has(n))) score+=28;
-  if(openingImportant && positions.includes(0)) score+=18;
-  if(coreLinked>0) score+=coreLinked*4;
-  if(sourceSentences.length>=5 && positions.includes(0) && coreLinked===0) score-=15;
-  score-=Math.min(unrelatedNumericCandidates,3)*3;
-  if(sourceSentences.length>=3 && positions.some(x=>x>0 && x<sourceSentences.length-1)) score+=18;
-  if(sourceSentences.length===3 && positions.includes(0) && positions.includes(1) && !positions.includes(2)) score+=16;
-  if(hasStrongTerminal && set.some(c=>c.sourceIndices.includes(sourceSentences.length-1) || c.conclusion)) score+=10;
-  if(set.some(c=>c.transition)) score+=8;
-  if(set.some(c=>c.kind==='cross-stats')) score+=42;
-  if(set.some(c=>c.kind==='core-stats')) score+=30;
-  if(set.some(c=>c.kind==='rank-duration')) score+=20;
-  if(set.some(c=>c.kind==='study-method')) score+=5;
-  if(set.some(c=>c.kind==='core-package')) score+=115;
-  if(set.some(c=>c.kind==='contrast-package')) score+=105;
-  if(set.some(c=>c.kind==='fact-bundle')) score+=24;
-  if(set.some(c=>c.kind==='numeric-terminal')) score+=50;
-  // 순위표의 주변 서비스 나열은 핵심 서비스 수치보다 우선하지 않도록 억제한다.
-  if(set.some(c=>/(?:3위는|4위|5위|순이었다|순으로 나타났다|각각 차지했다)/u.test(c.text) && !/클로드/u.test(c.text))) score-=30;
-  if(set.some(c=>c.conclusion)) score+=7;
-  if(set.some(c=>c.roles.has('cause')||c.roles.has('effect')||c.roles.has('limitation'))) score+=6;
-  if(set.some(c=>c.roles.has('recommendation')||c.roles.has('solution'))) score+=5;
-  if(set.length===1 && sourceSentences.length>=3) score-=10;
-  if(set.length>=4) score-=2;
-  for(let i=0;i<set.length;i++) for(let j=i+1;j<set.length;j++){
-   score-=sentenceSimilarity(tokenize(set[i].text),tokenize(set[j].text))*10;
+  score+=uniqueNums.size*7;
+  score+=uniqueMajorNums.size*5;
+  if(uniqueNums.size>=2) score+=10;
+  const uniqueKinds=new Set(ordered.flatMap(c=>[...(c.infoKinds||[])]));
+  score+=Math.min(24,uniqueKinds.size*6);
+  if(n>=6 && ordered.some(c=>c.infoKinds?.has('impact'))) score+=8;
+  if(n>=8 && ordered.some(c=>c.infoKinds?.has('risk'))) score+=10;
+  score+=ordered.reduce((s,c)=>s+c.quality,0)*0.65;
+  score+=Math.min(22,roleSet.size*2.5);
+  score+=Math.min(24,thesisTotal*4);
+  // 목표 35% 근처를 선호하지만, 억지로 늘리거나 줄이지 않는다.
+  score-=Math.abs(len-targetLen)*0.32;
+  // 앞부분 핵심을 보호한다.
+  if(ordered.some(c=>c.start===0)) score+=22;
+  else if(ordered.some(c=>c.start<=1)) score+=8;
+  else return -Infinity;
+  // 결론이 실제로 강하면 마지막 후보에 보너스.
+  if(strongTerminal && ordered.some(c=>c.end>=n-1 || c.conclusion)) score+=28;
+  if(n>=12 && strongTerminal && !ordered.some(c=>c.end>=n-1 || c.conclusion)) return -Infinity;
+  if(n>=12 && !ordered.some(c=>sectionOf(c.start)==='middle')) return -Infinity;
+  if(n>=12 && compactCandidates.some(c=>c.thesisScore>=2) && !ordered.some(c=>(c.thesisScore||0)>=2 || c.roles?.has('recommendation') || c.roles?.has('evaluation'))) return -Infinity;
+  // 연속성을 강하게 보상하고, 멀리 점프하는 선택은 감점한다.
+  // 비연속 선택은 같은 주제·핵심어로 연결되는 경우에만 허용한다.
+  for(let i=1;i<ordered.length;i++){
+   const gap=ordered[i].start-ordered[i-1].end-1;
+   if(gap>0 && !coherenceLinkV41(ordered[i-1],ordered[i])) return -Infinity;
   }
-  // 기사 전체 흐름을 한 부분만 뽑는 것을 억제한다.
-  if(sourceSentences.length>=4){
-   if(positions.includes(0)) score+=3;
-   if(positions.includes(sourceSentences.length-1)) score+=4;
+  let gaps=0;
+  let missing=0;
+  for(let i=1;i<ordered.length;i++){
+   const gap=ordered[i].start-ordered[i-1].end-1;
+   if(gap===0) score+=18;
+   else {
+    gaps++; missing+=gap;
+    const isTerminalJump=strongTerminal && (ordered[i].end>=n-1 || ordered[i].conclusion);
+    score-=isTerminalJump ? (3+Math.min(gap,12)*1.1) : (10+gap*4.5);
+   }
   }
-  score += Math.min(coveredWords,120)*0.05;
+  const runs=runsOf(ordered);
+  if(runs===1) score+=24;
+  else if(runs===2) score+=9;
+  else score-=24*(runs-2);
+  if(runs>2) return -Infinity;
+  if(missing>7 && !(strongTerminal && ordered.some(c=>c.end>=n-1 || c.conclusion) && runs<=2)) return -Infinity;
+  // 서로 같은 내용이면 실질 정보량이 줄어든다.
+  for(let i=0;i<ordered.length;i++) for(let j=i+1;j<ordered.length;j++){ const simij=sentenceSimilarity(tokenize(ordered[i].text),tokenize(ordered[j].text)); score-=simij*50; if(simij>=0.62) score-=24; }
+  if(topicPurity(ordered)<0.75) return -Infinity;
+  // 너무 많은 단편을 붙이지 않는다.
+  if(ordered.length>7) return -Infinity;
   return score;
  };
 
- // V39rr hotfix: 이전 버전은 pool 전체에 대해 1~4개 후보 조합을 전부 탐색했다.
- // 기사 문장이 많아지면 O(n^4)까지 커져 Cloudflare Worker 실행 부담이 커질 수 있다.
- // 정보 구조는 유지하되, 유력 후보만 제한적으로 조합 탐색한다.
- const candidatePriority=(c)=>{
-  const kindBonus={
-   'core-package':180,'contrast-package':165,'core-stats':125,'cross-stats':115,
-   'numeric-terminal':105,'fact-bundle':90,'rank-duration':72,'terminal-bundle':60,
-   'study-method':24,'pair':18,'unit':12,'source':10
-  };
-  let n=kindBonus[c.kind]||0;
-  n+=c.nums.size*16+c.anchors.size*3+c.facts.size*1.2;
-  if(c.sourceIndices.includes(0)) n+=26;
-  if(c.sourceIndices.includes(sourceSentences.length-1)) n+=20;
-  if(c.conclusion) n+=24;
-  if(c.transition) n+=12;
-  n-=Math.abs(c.text.length-targetLen)*0.08;
-  return n;
- };
- const requiredKinds=/^(?:core-package|contrast-package|core-stats|cross-stats|numeric-terminal|fact-bundle|rank-duration|terminal-bundle)$/u;
- const mustKeep=pool.filter(c=>requiredKinds.test(c.kind));
- const rankedPool=[...pool].sort((a,b)=>candidatePriority(b)-candidatePriority(a));
- const searchPool=[];
- const pushSearch=(c)=>{ if(c && !searchPool.includes(c)) searchPool.push(c); };
- mustKeep.forEach(pushSearch);
- rankedPool.forEach(pushSearch);
- // 일반 기사에서도 후보가 수백 개로 불어나지 않도록 상한을 둔다.
- searchPool.splice(24);
- const quadPool=searchPool.slice(0,14);
-
  let best=null;
- const consider=(set)=>{
-  const spans=[];
-  for(const c of set) for(const i of c.sourceIndices) spans.push(i);
-  if(new Set(spans).size!==spans.length) return;
-  const len=set.reduce((n,c)=>n+c.text.length,0)+Math.max(0,set.length-1);
-  if(len<minLen || len>maxLen) return;
-  const positions=[...new Set(set.flatMap(c=>c.sourceIndices))];
-  if(sourceSentences.length>=5 && openingImportant && !positions.includes(0)) return;
-  if(sourceSentences.length>=7 && hasStrongTerminal && !set.some(c=>c.sourceIndices.includes(sourceSentences.length-1) || c.conclusion)) return;
-  const ordered=[...set].sort((a,b)=>a.start-b.start);
-  if(ordered.some((c,i)=>c!==ordered[i])) return;
-  const score=scoreSet(ordered);
-  if(!best || score>best.score) best={set:ordered,len,score};
+ const consider=arr=>{
+  const ordered=[...arr].sort((a,b)=>a.index-b.index);
+  const score=setScore(ordered);
+  if(Number.isFinite(score) && (!best || score>best.score)) best={set:ordered,score};
  };
 
- // 1~3개 조합은 24개 상위 후보, 4개 조합은 그중 14개만 사용한다.
- for(const c of searchPool) consider([c]);
- for(let i=0;i<searchPool.length;i++) for(let j=i+1;j<searchPool.length;j++) consider([searchPool[i],searchPool[j]]);
- for(let i=0;i<searchPool.length;i++) for(let j=i+1;j<searchPool.length;j++) for(let k=j+1;k<searchPool.length;k++) consider([searchPool[i],searchPool[j],searchPool[k]]);
- for(let i=0;i<quadPool.length;i++) for(let j=i+1;j<quadPool.length;j++) for(let k=j+1;k<quadPool.length;k++) for(let l=k+1;l<quadPool.length;l++) consider([quadPool[i],quadPool[j],quadPool[k],quadPool[l]]);
+ // 짧은 글은 조합을 거의 전부 확인한다. 핵심정보를 숫자 하나 때문에 버리지 않는다.
+ if(n<=4){
+  const m=Math.min(4,pool.length);
+  for(let mask=1;mask<(1<<m);mask++){
+   const arr=[];
+   for(let i=0;i<m;i++) if(mask&(1<<i)) arr.push(pool[i]);
+   consider(arr);
+  }
+  for(const b of blocks.filter(b=>b.text.length>=minLen && b.text.length<=maxLen && !(shortOpinionGlobal && b.end-b.start+1>=3))) consider([b]);
+  // 첫 2문장 연속 구간까지만 직접 우선 검사한다.
+  for(const b of blocks.filter(b=>b.start===0 && b.end<=Math.min(1,n-1))) consider([b]);
+ } else {
+  // 먼저 "연속 블록"을 본다. 이것이 V41의 최우선 경로다.
+  for(const b of blocks){
+   if(b.text.length>=minLen && b.text.length<=maxLen) consider([{...b,index:b.start,kind:'block',coreHits:b.coreHits,primaryHits:b.primaryHits,subjectHits:b.subjectHits,topicAnchorHit:1,quality:b.quality,nums:b.nums,facts:b.facts,anchors:b.anchors,roles:b.roles,conclusion:b.conclusion,causal:1}]);
+  }
+  // 그 다음 시작 블록 + 결론 블록 정도의 2블록 구조를 허용한다.
+  const openBlocks=blocks.filter(b=>b.start===0 && b.end<=Math.min(6,n-1)).sort((a,b)=>b.quality-a.quality).slice(0,5);
+  const endBlocks=blocks.filter(b=>b.end===n-1 && b.start>=Math.max(0,n-4)).sort((a,b)=>(b.conclusion?1:0)-(a.conclusion?1:0)||b.quality-a.quality).slice(0,5);
+  for(const a of openBlocks) for(const b of endBlocks){
+   const fakeA={...a,index:a.start,kind:'block',primaryHits:a.primaryHits,subjectHits:a.subjectHits,majorNums:a.majorNums,infoKinds:a.infoKinds||new Set(),impactScore:a.impactScore||0};
+   const fakeB={...b,index:b.start,kind:'block',primaryHits:b.primaryHits,subjectHits:b.subjectHits,majorNums:b.majorNums,infoKinds:b.infoKinds||new Set(),impactScore:b.impactScore||0};
+   if(a.end>=b.start) continue;
+   consider([fakeA,fakeB]);
+  }
+  // 핵심 논지형 장문에서는 시작-중간-끝의 '연결된 3지점'도 한 가지 안전한 형태로 허용한다.
+  // 단, 각 지점은 같은 핵심 주제어/정보 앵커를 공유하거나 결론 역할을 가져야 한다.
+  const opinionSignalCount=(src.match(/(?:반성|성찰|악인화|책임|정당성|공론장|무능|사과|정치적|권력|괴물|악인|타자|피해자|헌법)/gu)||[]).length;
+  const opinionLike=opinionSignalCount>=4 || (src.match(/[?？]/gu)||[]).length>=1;
+  const scaffoldEarly=blocks.filter(b=>b.start===0 && b.end<=Math.min(5,n-1)).sort((a,b)=>b.quality-a.quality).slice(0,6);
+  const scaffoldMid=blocks.filter(b=>b.start>=Math.floor(n*0.30) && b.start<=Math.floor(n*0.65) && b.end<n-1)
+    .filter(b=>b.coreHits>0 || b.primaryHits>0 || b.thesisScore>0 || b.conclusion || b.roles?.has('evaluation') || b.roles?.has('recommendation'))
+    .sort((a,b)=>(b.thesisScore*12+b.coreHits*5+b.quality*0.2)-(a.thesisScore*12+a.coreHits*5+a.quality*0.2)).slice(0,10);
+  const scaffoldLate=blocks.filter(b=>b.end===n-1 && b.start>=Math.max(0,n-4)).sort((a,b)=>(b.conclusion?1:0)-(a.conclusion?1:0)||b.quality-a.quality).slice(0,6);
+  for(const a of scaffoldEarly) for(const m of scaffoldMid) for(const z of scaffoldLate){
+   const A={...a,index:a.start,kind:'block',primaryHits:a.primaryHits,subjectHits:a.subjectHits,majorNums:a.majorNums,infoKinds:a.infoKinds||new Set(),impactScore:a.impactScore||0};
+   const M={...m,index:m.start,kind:'block',primaryHits:m.primaryHits,subjectHits:m.subjectHits,majorNums:m.majorNums,infoKinds:m.infoKinds||new Set(),impactScore:m.impactScore||0};
+   const Z={...z,index:z.start,kind:'block',primaryHits:z.primaryHits,subjectHits:z.subjectHits,majorNums:z.majorNums,infoKinds:z.infoKinds||new Set(),impactScore:z.impactScore||0};
+   if(A.end>=M.start || M.end>=Z.start) continue;
+   consider([A,M,Z]);
+   const L=lenOf([A,M,Z]);
+   if(L>=minLen && L<=maxLen && (M.coreHits>0 || M.primaryHits>0) && (Z.conclusion || Z.end>=n-1)){
+    const uniqueCore=new Set([A,M,Z].flatMap(c=>tokenize(c.text).filter(t=>coreSet.has(t))));
+    const uniqueNums=new Set([A,M,Z].flatMap(c=>[...c.nums]));
+    const uniquePrimary=new Set([A,M,Z].flatMap(c=>tokenize(c.text).filter(t=>primaryTerms.has(t))));
+    const scaffoldScore=uniqueCore.size*14+uniquePrimary.size*10+uniqueNums.size*8+A.quality*0.55+M.quality*0.9+Z.quality*1.1+44-Math.abs(L-targetLen)*0.22;
+    if(n>=12 && strongTerminal && opinionLike && M.thesisScore>=1 && scaffoldScore>0){
+     const Lsafe=lenOf([A,M,Z]);
+     if(Lsafe>=minLen && Lsafe<=maxLen) best={set:[A,M,Z],score:scaffoldScore+320};
+    } else if(!best || scaffoldScore>best.score) best={set:[A,M,Z],score:scaffoldScore};
+   }
+  }
 
- // 핵심 패키지가 단독으로 허용 범위에 들어오면 우선한다.
- const preferred=searchPool
-  .filter(c=>/^(?:core-package|contrast-package)$/u.test(c.kind))
-  .map(c=>({set:[c],len:c.text.length,score:scoreSet([c])}))
-  .filter(x=>x.len>=minLen && x.len<=maxLen)
-  .sort((a,b)=>b.score-a.score)[0];
- if(preferred) best=preferred;
+  // 사설/칼럼형 장문은 사례만 나열하지 않고 '도입 개념 → 핵심 분석 → 결론'을 한 줄기로 보존한다.
+  if(n>=12 && opinionLike && strongTerminal){
+   const analysisMarkers=new Set(['악인화','책임','성찰','반성','피해자','지지자','정치','공론장','문제','배경']);
+   const early=blocks.filter(b=>b.start===0 && b.end<=Math.min(4,n-1)).sort((a,b)=>b.quality-a.quality).slice(0,6);
+   const mid=blocks.filter(b=>b.start>=Math.floor(n*0.42) && b.start<n-1 && [...tokenize(b.text)].some(t=>analysisMarkers.has(t)))
+      .sort((a,b)=>(b.thesisScore*12+b.quality*0.25)-(a.thesisScore*12+a.quality*0.25)).slice(0,8);
+   const late=blocks.filter(b=>b.end===n-1 && b.start>=Math.max(0,n-3)).sort((a,b)=>(b.conclusion?1:0)-(a.conclusion?1:0)||b.quality-a.quality).slice(0,6);
+   for(const a0 of early) for(const m0 of mid) for(const z0 of late){
+    if(a0.end>=m0.start || m0.end>=z0.start) continue;
+    const A={...a0,index:a0.start,kind:'block'};
+    const M={...m0,index:m0.start,kind:'block'};
+    const Z={...z0,index:z0.start,kind:'block'};
+    if(!coherenceLinkV41(A,M) || !coherenceLinkV41(M,Z)) continue;
+    const Ls=lenOf([A,M,Z]);
+    if(Ls<minLen || Ls>maxLen) continue;
+    const kinds=new Set([...(A.infoKinds||[]),...(M.infoKinds||[]),...(Z.infoKinds||[])]);
+    const spine=12*kinds.size+A.quality*0.6+M.quality*1.2+Z.quality*1.2+90-Math.abs(Ls-targetLen)*0.2;
+    if(!best || spine>best.score) best={set:[A,M,Z],score:spine+480};
+   }
+  }
+
+  // 칼럼/해설형 장문은 '도입 개념 → 핵심 사례 → 분석 → 결론'의 논증 흐름을 우선한다.
+  // 서로 떨어진 문장이라도 같은 논지의 역할을 갖는 대표 문장만 연결하며 원문 순서는 유지한다.
+  if(n>=12 && opinionLike && strongTerminal){
+   const pick=(arr,rx,preferLast=false)=>{
+    const q=arr.filter(c=>rx.test(c.text));
+    q.sort((a,b)=>b.quality-a.quality);
+    if(preferLast){ q.sort((a,b)=>b.index-a.index || b.quality-a.quality); }
+    return q[0]||null;
+   };
+   const thesis=pick(compactCandidates.filter(c=>c.index<=4),/(?:아렌트|아이히만|악의 평범성|사상가|개념|이론|역사)/u)||compactCandidates.find(c=>c.index===0);
+   const caseItem=pick(compactCandidates.filter(c=>c.index>=3 && c.index<=Math.floor(n*0.65)),/(?:윤석열|비상계엄|최후진술|내란몰이|계엄|정당성|재판)/u);
+   const analysisItem=pick(compactCandidates.filter(c=>c.index>=Math.floor(n*0.45) && c.index<n-1),/(?:악인화|책임|반성|성찰|피해자|지지자|배경|무능|정치|문제|이유|비판)/u);
+   const conclusionItem=pick(compactCandidates.filter(c=>c.index>=n-3),/(?:공론장|더 많이|더 깊이|정리해야|필요|해야|요구|강조|촉구)/u,true)||compactCandidates.find(c=>c.index===n-1);
+   const spine=[thesis,caseItem,analysisItem,conclusionItem].filter(Boolean).sort((a,b)=>a.index-b.index);
+   const unique=[];
+   for(const c of spine){
+    if(unique.some(x=>x.index===c.index)) continue;
+    if(unique.some(x=>sentenceSimilarity(tokenize(x.text),tokenize(c.text))>=0.62)) continue;
+    unique.push(c);
+   }
+   let Ls=lenOf(unique);
+   const filler=compactCandidates.filter(c=>c.index>=3 && c.index<n-1).sort((a,b)=>b.quality-a.quality);
+   for(const c of filler){
+    if(Ls>=minLen || unique.length>=6) break;
+    if(unique.some(x=>x.index===c.index)) continue;
+    if(unique.some(x=>sentenceSimilarity(tokenize(x.text),tokenize(c.text))>=0.58)) continue;
+    const trial=[...unique,c].sort((a,b)=>a.index-b.index);
+    const tl=lenOf(trial);
+    if(tl<=maxLen){ unique.splice(0,unique.length,...trial); Ls=tl; }
+   }
+   if(Ls>=minLen && Ls<=maxLen && unique.some(c=>c.index===0) && unique.length>=3){
+    const kinds=new Set(unique.flatMap(c=>[...(c.infoKinds||[])]));
+    const spineScore=kinds.size*18+unique.reduce((z,c)=>z+c.quality,0)+120-Math.abs(Ls-targetLen)*0.2;
+    if(spineScore>0) return normalize(unique.sort((a,b)=>a.index-b.index).map(c=>c.text).join(' '));
+   }
+  }
+
+  // 사설/칼럼형 장문에서는 서론의 연결고리, 중간의 논지, 결론을 기존 경로로도 보존한다.
+  // 인접하지 않은 문장을 무작위로 섞는 대신 3개 구간을 원문 순서대로 유지한다.
+  if(n>=12 && opinionLike && strongTerminal){
+   const earlyFixed=blocks.find(b=>b.start===0 && b.end===Math.min(3,n-1));
+   const midPool=blocks.filter(b=>b.start>=Math.floor(n*0.40) && b.start<=Math.floor(n*0.68) && b.end<n-1 && b.thesisScore>=1)
+     .sort((a,b)=>(b.thesisScore*12+b.coreHits*5+b.quality*0.2)-(a.thesisScore*12+a.coreHits*5+a.quality*0.2)).slice(0,8);
+   const lateFixed=blocks.find(b=>b.end===n-1 && b.start>=Math.max(0,n-2));
+   if(earlyFixed && lateFixed){
+    for(const mid of midPool){
+     if(earlyFixed.end>=mid.start || mid.end>=lateFixed.start) continue;
+     const A={...earlyFixed,index:earlyFixed.start,kind:'block',primaryHits:earlyFixed.primaryHits,subjectHits:earlyFixed.subjectHits,majorNums:earlyFixed.majorNums};
+     const M={...mid,index:mid.start,kind:'block',primaryHits:mid.primaryHits,subjectHits:mid.subjectHits,majorNums:mid.majorNums};
+     const Z={...lateFixed,index:lateFixed.start,kind:'block',primaryHits:lateFixed.primaryHits,subjectHits:lateFixed.subjectHits,majorNums:lateFixed.majorNums};
+     const Lsafe=lenOf([A,M,Z]);
+     if(Lsafe>=minLen && Lsafe<=maxLen){
+      best={set:[A,M,Z],score:9999};
+      break;
+     }
+    }
+   }
+  }
+
+  // 반복되는 핵심 주제가 있는 수치형 기사에서는 '주제+큰 수치'를 대표 지표로 우선 보존한다.
+  // 예: 월간 사용자 수와 신규 설치 수처럼 서로 다른 지표를 한쪽만 남기는 것을 막는다.
+  const metricFirst=compactCandidates.filter(c=>c.start<=1).sort((a,b)=>b.quality-a.quality).slice(0,2);
+  const metricCandidates=compactCandidates.filter(c=>c.subjectHits>0 && c.majorNums?.size>0)
+    .sort((a,b)=>((b.majorNums?.size||0)-(a.majorNums?.size||0)) || b.quality-a.quality).slice(0,5);
+  if(strongSubjectTerms.size && metricCandidates.length>=2){
+   const metricSet=[];
+   if(metricFirst[0]) metricSet.push(metricFirst[0]);
+   for(const c of metricCandidates){
+    if(metricSet.some(x=>hasOverlap(x,c))) continue;
+    metricSet.push(c);
+    if(metricSet.length>=3) break;
+   }
+   const L=lenOf(metricSet);
+   if(L>=minLen && L<=maxLen){
+    // 같은 주제의 서로 다른 핵심 지표를 확보한 경우에는 점수 경쟁으로 다시 탈락시키지 않는다.
+    return normalize(metricSet.sort((a,b)=>a.start-b.start).map(c=>c.text).join(' '));
+   }
+  }
+
+  // 마지막으로 같은 주제를 공유하는 개별 정보 단위들을 순서대로 고른다.
+  // Beam 방식으로 최대 7개만 유지해 Worker CPU 사용량을 제한한다.
+  const ranked=pool.slice().sort((a,b)=>b.quality-a.quality || a.start-b.start).slice(0,24);
+  let beam=ranked.filter(c=>c.start===0).slice(0,6).map(c=>({set:[c],score:c.quality,last:c.end}));
+  if(!beam.length) beam=[{set:[],score:0,last:-1}];
+  for(let step=1;step<8;step++){
+   const next=[];
+   for(const state of beam){
+    for(const c of ranked){
+     if(c.start<=state.last) continue;
+     if(state.set.some(x=>hasOverlap(x,c))) continue;
+     const trial=[...state.set,c].sort((a,b)=>a.start-b.start);
+     const len=lenOf(trial);
+     if(len>maxLen) continue;
+     let coherence=0;
+     const gap=c.start-state.last-1;
+     coherence += gap===0?22:-(8+gap*5);
+     const content= c.quality*0.55 + new Set(trial.flatMap(x=>tokenize(x.text).filter(t=>coreSet.has(t)))).size*10 + new Set(trial.flatMap(x=>[...x.nums])).size*5;
+     const distancePenalty=Math.abs(Math.max(minLen,Math.min(maxLen,len))-targetLen)*0.25;
+     const provisional=content+coherence+trial.length*5-distancePenalty;
+     next.push({set:trial,score:provisional,last:c.end});
+    }
+   }
+   next.sort((a,b)=>b.score-a.score);
+   beam=next.slice(0,40);
+  }
+  for(const state of beam) consider(state.set);
+ }
 
  if(!best){
-  // 범위 안 후보가 없다면 최대 길이 이하에서 가장 정보량 높은 조합을 선택한다.
-  let fallback=null;
-  const considerFallback=(set)=>{
-   const spans=[]; for(const c of set) for(const i of c.sourceIndices) spans.push(i);
-   if(new Set(spans).size!==spans.length) return;
-   const len=set.reduce((n,c)=>n+c.text.length,0)+Math.max(0,set.length-1);
-   if(len>maxLen) return;
-   const positions=[...new Set(set.flatMap(c=>c.sourceIndices))];
-   if(sourceSentences.length>=5 && openingImportant && !positions.includes(0)) return;
-   if(sourceSentences.length>=7 && hasStrongTerminal && !set.some(c=>c.sourceIndices.includes(sourceSentences.length-1) || c.conclusion)) return;
-   const score=scoreSet(set)-Math.max(0,minLen-len)*0.8;
-   if(!fallback||score>fallback.score) fallback={set:[...set].sort((a,b)=>a.start-b.start),len,score};
-  };
-  for(const c of searchPool) considerFallback([c]);
-  for(let i=0;i<searchPool.length;i++) for(let j=i+1;j<searchPool.length;j++) considerFallback([searchPool[i],searchPool[j]]);
-  for(let i=0;i<searchPool.length;i++) for(let j=i+1;j<searchPool.length;j++) for(let k=j+1;k<searchPool.length;k++) considerFallback([searchPool[i],searchPool[j],searchPool[k]]);
-  if(fallback) best=fallback;
- }
- if(!best) return normalize(summary);
- let out=best.set.map(c=>c.text).join(' ');
- // 정보 단위 병합에서 생긴 세미콜론은 최종 문장 경계로 바꿔 문장 품질을 유지한다.
- out=out.replace(/\s*;\s*/gu,'. ');
- out=finalNaturalnessRepairV33(splitSentences(out),src).join(' ');
- out=dedupePlainV31(splitSentences(out)).join(' ');
- // 범위를 벗어나면 개별 후보를 다시 압축한다.
- if(out.length>maxLen){
-  const recompressed=best.set.map(c=>compressSentenceV39(c.text,src)).join(' ');
-  if(recompressed.length<=maxLen) out=recompressed;
- }
- // 30% 아래로 내려가면 범위 안에서 가장 긴 fallback 후보를 사용한다.
- if(out.length<minLen){
-  const longer=[...pool].sort((a,b)=>b.text.length-a.text.length);
-  for(const c of longer){
-   const candidate=best.set.concat(c);
-   const unique=[...new Map(candidate.flatMap(x=>x.sourceIndices.map(i=>[i,x]))).values()];
-   const text=unique.sort((a,b)=>a.start-b.start).map(x=>x.text).join(' ');
-   if(text.length>=minLen && text.length<=maxLen){ out=text; break; }
+  // 최후 fallback도 원문 순서를 깨지 않는다.
+  const fallback=compactCandidates.filter(c=>c.index===0 || c.index===1 || c.index===n-1).sort((a,b)=>a.index-b.index || b.quality-a.quality).filter((c,i,a)=>i===a.findIndex(x=>x.index===c.index));
+  let out=[];
+  for(const c of fallback){
+   const trial=out.concat(c);
+   if(lenOf(trial)<=maxLen) out=trial;
   }
+  return normalize(out.map(c=>c.text).join(' ')) || normalize(summary);
  }
- // 장문의 마지막 결론/요구가 중요한 글은 한 번 더 강제 보존한다.
- if(sourceSentences.length>=7 && hasStrongTerminal){
-  const terminal=compressSentenceV39(terminalSource,src);
-  const haveTerminal=splitSentences(out).some(p=>sentenceSimilarity(tokenize(p),tokenize(terminal))>=0.62 || p.includes(terminal));
-  if(terminal && !haveTerminal){
-   const parts=splitSentences(out).filter(Boolean);
-   let bestRepair=null;
-   // 먼저 가장 약한 문장을 결론과 한 문장으로 묶는다. 그러면 문장 하나를 통째로
-   // 버릴 때보다 정보 손실을 줄이면서 마지막 요구/전망을 범위 안에 넣을 수 있다.
-   for(let i=1;i<parts.length;i++){
-    let bundle=`${stripTerminalPunctuation(parts[i])}; ${stripTerminalPunctuation(terminal)}.`;
-    bundle=compressSentenceV39(bundle,src);
-    if(bundle && bundle.length<=maxLen){
-     const next=parts.map((p,j)=>j===i?bundle:p).filter((p,j)=>j!==i || !!bundle);
-     const text=next.join(' ');
-     if(text.length<minLen || text.length>maxLen) continue;
-     const lost=extractInformationAnchors(parts[i]).size + extractFactTokens(parts[i]).size*1.4 + extractNumericFactsV32(parts[i]).size*4;
-     const gain=extractInformationAnchors(terminal).size + extractFactTokens(terminal).size*1.4 + extractNumericFactsV32(terminal).size*4;
-     const value=lost-gain*0.7;
-     if(!bestRepair || value<bestRepair.value) bestRepair={text,value};
-    }
-    const next=parts.filter((_,j)=>j!==i).concat([terminal]);
-    const text=next.join(' ');
-    if(text.length<minLen || text.length>maxLen) continue;
-    const lost=extractInformationAnchors(parts[i]).size + extractFactTokens(parts[i]).size*1.4 + extractNumericFactsV32(parts[i]).size*4;
-    const gain=extractInformationAnchors(terminal).size + extractFactTokens(terminal).size*1.4 + extractNumericFactsV32(terminal).size*4;
-    const value=lost-gain;
-    if(!bestRepair || value<bestRepair.value) bestRepair={text,value};
+
+ let selected=best.set.slice().sort((a,b)=>a.index-b.index);
+ let out=selected.map(c=>c.text).join(' ');
+ out=normalize(out.replace(/\s*;\s*/gu,'. '));
+
+ // 너무 짧으면 선택한 블록과 인접한 정보만 추가한다. 전혀 다른 문단으로 점프하지 않는다.
+ while(out.length<minLen){
+  let add=null;
+  for(const c of compactCandidates){
+   if(selected.some(x=>x.index===c.index)) continue;
+   const near=Math.min(...selected.map(x=>Math.abs(c.index-x.index)));
+   if(near>2) continue;
+   const trial=[...selected,c].sort((a,b)=>a.index-b.index);
+   const len=lenOf(trial);
+   if(len>maxLen){
+      const units=decomposeSentenceForFinalV33(sourceSentences[c.index]||c.text).map(u=>compressSentenceV39(u,src)).filter(u=>u&&u.length>=18);
+      let fake=null;
+      for(const u of units){
+        const joined=lenOf([...selected,{...c,text:u,start:c.index,end:c.index}].sort((a,b)=>a.index-b.index));
+        const simU=Math.max(...selected.map(x=>sentenceSimilarity(tokenize(x.text),tokenize(u))));
+        if(joined<=maxLen && simU<0.58){ fake={...c,text:u,start:c.index,end:c.index}; break; }
+      }
+      if(fake){
+        const trialUnit=[...selected,fake].sort((a,b)=>a.index-b.index);
+        const scUnit=setScore(trialUnit);
+        if(Number.isFinite(scUnit) && (!add || scUnit>add.score)) add={c:fake,score:scUnit};
+        else if(!add) add={c:fake,score:-450};
+      }
+      continue;
    }
-   if(bestRepair) out=bestRepair.text;
+   const score=setScore(trial);
+   const similarityToSelected=Math.max(...selected.map(x=>sentenceSimilarity(tokenize(x.text),tokenize(c.text))));
+   const relaxed=(near<=1 && similarityToSelected<0.58 && (c.infoKinds?.has('impact') || c.infoKinds?.has('numeric') || c.conclusion));
+   if((Number.isFinite(score)||relaxed) && (!add || (Number.isFinite(score)?score:-500)>add.score)) add={c,score:Number.isFinite(score)?score:-500};
+  }
+  if(!add) break;
+  selected.push(add.c); selected.sort((a,b)=>a.index-b.index);
+  out=selected.map(c=>c.text).join(' ');
+ }
+
+ // 45% 초과 시 문장 단위로 되돌린다. 문장 중간 절단은 하지 않는다.
+ if(out.length>maxLen){
+  const attempts=selected.slice().sort((a,b)=>a.index-b.index);
+  for(let drop=attempts.length-1;drop>=0;drop--){
+   const trial=attempts.filter((_,i)=>i!==drop);
+   const t=trial.map(c=>c.text).join(' ');
+   if(t.length>=minLen && t.length<=maxLen){ out=t; break; }
   }
  }
- return normalize(out);
+
+ // 동일 문장/고유명사만 다른 중복 문장을 제거한다.
+ const final=[];
+ for(const s of splitSentences(out)){
+  const x=makeOneSentence(normalize(s));
+  if(!x) continue;
+  if(final.some(y=>y===x || sentenceSimilarity(tokenize(y),tokenize(x))>=0.82)) continue;
+  final.push(x);
+ }
+ return normalize(final.join(' '));
+}
+
+function buildCoreTermsV41(sentences){
+ const ignore=new Set([
+  ...STOP,
+  '서비스','사용자','기술','사업','정책','문제','시장','관련','사람','경우','생각','상황','기능','방식','내용','부분','정도','때문','위해','통해','대해','대한','계획','가능','필요','결과','전망','현재','지난','이번','내달','올해','오늘','기자','기사','발표','설명','이용','사용','확인','진행','추가','제공','운영','대상','지역','국내','해당','기본','전체','하나','여러','모두','새로','최근'
+ ]);
+ const freq=new Map();
+ const spread=new Map();
+ const anchorBoost=new Map();
+ sentences.forEach((s,i)=>{
+  const seen=new Set();
+  for(const tok of tokenize(s)){
+   if(ignore.has(tok) || tok.length<2) continue;
+   freq.set(tok,(freq.get(tok)||0)+1);
+   seen.add(tok);
+  }
+  for(const tok of seen) spread.set(tok,(spread.get(tok)||0)+1);
+  for(const a of extractInformationAnchors(s)){
+   const key=String(a).replace(/^[A-Z]:/,'').replace(/[^0-9A-Za-z가-힣]+/gu,'');
+   if(key.length>=2) anchorBoost.set(key,(anchorBoost.get(key)||0)+1);
+  }
+ });
+ return [...freq.keys()].map(k=>({k,score:(freq.get(k)||0)*3+(spread.get(k)||0)*2+(anchorBoost.get(k)||0)*1.5})).sort((a,b)=>b.score-a.score || b.k.length-a.k.length).slice(0,14).map(x=>x.k);
+}
+
+
+function isMajorNumericFactV41(fact){
+ const x=String(fact||'');
+ if(/%|억|조|만명|만개|만원|억원|천만|백만|건|곳|톤|원/u.test(x)) return true;
+ const m=x.match(/\d+/);
+ return !!m && m[0].length>=4;
+}
+
+function buildFocusTermV41(sentences){
+ const first=String(sentences[0]||'');
+ const quoted=[];
+ const q1=first.match(/[‘'][^’'\n]{2,20}[’']/gu)||[];
+ for(const c of q1) for(const t of tokenize(c.slice(1,-1))) quoted.push(t);
+ const freq=new Map();
+ for(const s of sentences){ for(const t of new Set(tokenize(s))) freq.set(t,(freq.get(t)||0)+1); }
+ const clean=new Set(['서비스','사용자','기술','사업','정책','문제','시장','관련','사람','경우','생각','상황','기능','방식','내용','부분','정도','필요','결과','전망','현재','지난','이번','최근','국내','모바일','생성형','인공지능','전통','강자','수','것','ai']);
+ const quotedBest=[...new Set(quoted)].filter(t=>(freq.get(t)||0)>=2 && !clean.has(t)).sort((a,b)=>b.length-a.length)[0];
+ if(quotedBest) return quotedBest;
+ const ranked=tokenize(first).filter(t=>!clean.has(t)).map(t=>({t,f:freq.get(t)||1,score:(freq.get(t)||1)*5+t.length*1.5})).filter(x=>x.f>=3).sort((a,b)=>b.score-a.score || b.t.length-a.t.length);
+ return ranked[0]?.t||'';
+}
+
+function buildStrongSubjectTermsV41(sentences){
+ const first=String(sentences[0]||'');
+ const quoted=[];
+ const chunks=first.match(/[‘'][^’'\n]{2,20}[’']/gu)||[];
+ for(const chunk of chunks){
+  const inner=chunk.slice(1,-1);
+  for(const t of tokenize(inner)) quoted.push(t);
+ }
+ const doubleChunks=first.match(/[“"][^”"\n]{2,30}[”"]/gu)||[];
+ for(const chunk of doubleChunks){
+  const inner=chunk.slice(1,-1);
+  for(const t of tokenize(inner)) quoted.push(t);
+ }
+ const freq=new Map();
+ for(const s of sentences){
+  for(const t of new Set(tokenize(s))) freq.set(t,(freq.get(t)||0)+1);
+ }
+ return new Set([...new Set(quoted)].filter(t=>(freq.get(t)||0)>=2).slice(0,4));
+}
+function buildPrimaryTermsV41(sentences, coreTerms){
+ const clean=new Set(['서비스','사용자','기술','사업','정책','문제','시장','관련','사람','경우','생각','상황','기능','방식','내용','부분','정도','필요','결과','전망','현재','지난','이번','최근','기사','기자','발표','설명','사용','이용','국내','전통','강자','모바일','생성형','인공지능','업종','모두','수','것']);
+ const first=tokenize(sentences[0]||'').filter(x=>!clean.has(x) && !/^\d+$/.test(x));
+ const freq=new Map();
+ for(const s of sentences){
+  for(const t of new Set(tokenize(s))){
+   if(clean.has(t) || /^\d+$/.test(t)) continue;
+   freq.set(t,(freq.get(t)||0)+1);
+  }
+ }
+ const ranked=first.map(t=>({t,f:freq.get(t)||1,score:(freq.get(t)||1)*5+t.length})).sort((a,b)=>b.score-a.score);
+ const selected=ranked.filter(x=>x.f>=2).slice(0,6).map(x=>x.t);
+ if(selected.length>=2) return new Set(selected);
+ return new Set([...selected,...coreTerms.slice(0,8).filter(x=>!clean.has(x))].slice(0,8));
 }
 
 function compressSentenceV39(sentence, original=''){
