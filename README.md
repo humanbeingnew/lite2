@@ -1,3 +1,7 @@
+## V47
+
+V47 adds short-text candidate selection, numeric preservation, Markdown cleanup, and structural diagnosis protection.
+
 # Lite 문단 요약기 V41
 
 Cloudflare Workers용 초경량 한국어 뉴스/문서 요약기입니다. 외부 AI API 없이 동작하며 원문 약 35%를 목표로 압축합니다. 허용 범위는 30~45%입니다.
