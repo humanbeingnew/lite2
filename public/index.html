@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lite 문단 요약기</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f6f8;color:#17191c;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:720px;margin:auto;padding:28px 16px}h1{margin:0 0 5px;font-size:24px}.sub{color:#666;font-size:13px;margin:0 0 20px}
+.card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:16px;margin:12px 0}
+input,textarea{width:100%;padding:12px;border:1px solid #ccc;border-radius:10px;font:inherit}textarea{min-height:180px;resize:vertical}
+.row{display:flex;gap:8px;margin-top:10px}button{border:0;border-radius:10px;padding:11px 15px;background:#17191c;color:white;font-weight:700;cursor:pointer}button.secondary{background:#eee;color:#222}
+.switch{display:flex;justify-content:space-between;align-items:center;padding:11px 0;border-bottom:1px solid #eee}.switch:last-child{border:0}
+.toggle{width:48px;height:28px;border-radius:20px;padding:3px;background:#bbb}.toggle i{display:block;width:22px;height:22px;background:white;border-radius:50%;transition:.15s}.toggle.on{background:#17191c}.toggle.on i{transform:translateX(20px)}
+.result{line-height:1.8}.summary-lines{display:grid;gap:12px}.summary-line{white-space:normal;overflow:visible;word-break:keep-all}.small{font-size:12px;color:#777;margin-top:7px}
+</style></head>
+<body><main>
+<h1>⚡ Lite 문단 요약기</h1><p class="sub">AI API 없이 핵심 주장·근거·숫자를 보존하며 원문의 약 35%로 압축합니다. (허용 30~45%)</p>
+<section class="card"><input id="url" placeholder="웹페이지 URL"><div class="row"><button id="fetch">본문 가져오기</button></div><div class="small">일부 사이트는 보안 정책 때문에 가져오지 못할 수 있습니다.</div></section>
+<section class="card"><textarea id="text" placeholder="긴 글을 붙여넣으세요."></textarea><div class="row"><button id="sum">요약하기</button><button class="secondary" id="clear">지우기</button></div></section>
+<section class="card">
+<div class="switch"><span>🖼 이미지/동영상 숨김</span><button class="toggle on" id="media"><i></i></button></div>
+<div class="switch"><span>📢 광고 숨김</span><button class="toggle on" id="ads"><i></i></button></div>
+</section>
+<section class="card"><b>요약 결과</b><div class="result" id="result" style="margin-top:10px">아직 요약하지 않았습니다.</div></section>
+</main>
+<script>
+const $=x=>document.getElementById(x);let media=true,ads=true;
+function renderSummary(s){const lines=String(s||"").split(/\n+/).map(x=>x.trim()).filter(Boolean);if(!lines.length)return "요약 결과가 없습니다.";return `<div class="summary-lines">${lines.map(x=>`<div class="summary-line">${escapeHtml(x)}</div>`).join("")}</div>`}
+function escapeHtml(s){return s.replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]))}
+async function readApi(r){
+ const raw=await r.text();
+ let d=null;
+ try{d=raw?JSON.parse(raw):null}catch(_){}
+ if(!d){
+  const preview=raw.replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim().slice(0,180);
+  throw Error(`서버 오류 (${r.status}). ${preview||"응답 내용을 읽을 수 없습니다."}`);
+ }
+ if(!r.ok) throw Error(d.detail?d.error+" ("+d.detail+")":(d.error||`서버 오류 (${r.status})`));
+ return d;
+}
+
+function tog(id,s){$(id).classList.toggle("on",s)}
+$("media").onclick=()=>{media=!media;tog("media",media)};$("ads").onclick=()=>{ads=!ads;tog("ads",ads)};
+$("clear").onclick=()=>{$("text").value="";$("url").value="";$("result").textContent="아직 요약하지 않았습니다."};
+$("sum").onclick=async()=>{
+ const text=$("text").value.trim();if(!text){$("result").textContent="요약할 글을 먼저 입력하세요.";return}
+ $("result").textContent="핵심 문장을 찾는 중...";
+ try{let r=await fetch("/api/summarize",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});let d=await readApi(r);$("result").innerHTML=renderSummary(d.summary)}catch(e){$("result").textContent=e.message}
+};
+$("fetch").onclick=async()=>{
+ const url=$("url").value.trim();if(!url){$("result").textContent="URL을 입력하세요.";return}
+ $("result").textContent="본문 가져오는 중...";
+ try{let r=await fetch("/api/fetch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});let d=await readApi(r);$("text").value=d.text;$("result").textContent="본문을 가져왔습니다. '문단별 요약'을 눌러주세요."}catch(e){$("result").textContent=e.message}
+};
+</script></body></html>

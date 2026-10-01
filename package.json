@@ -1,0 +1,19 @@
+{
+  "name": "lite-paragraph-summarizer",
+  "private": true,
+  "type": "module",
+  "version": "48.0.0",
+  "description": "Free Korean news and document summarizer for Cloudflare Workers (V48 topic balance, metadata filtering, short dense text safety)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "node --check src/worker.js",
+    "test": "node regression-v41.mjs",
+    "audit": "node content-audit-v41.mjs",
+    "mix": "node mixing-v41.mjs",
+    "stress": "node stress-v41.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.140.0"
+  }
+}
