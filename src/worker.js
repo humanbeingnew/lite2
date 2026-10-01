@@ -4,7 +4,7 @@ export default {
 
   // 배포 확인용 경량 헬스체크. API가 살아 있는지 JSON으로 바로 확인할 수 있다.
   if (request.method === "GET" && u.pathname === "/api/health") {
-   return json({ ok: true, service: "lite-paragraph-summarizer", version: "47.0.0" });
+   return json({ ok: true, service: "lite-paragraph-summarizer", version: "48.0.0" });
   }
 
   if (request.method === "POST" && u.pathname === "/api/summarize") {
@@ -62,6 +62,14 @@ function stripNewsUi(text) {
   .replace(/__([^_]+)__/gu, '$1')
   .replace(/^\s*\|.*\|\s*$/gmu, ' ')
   .replace(/^\s*[-:| ]{3,}\s*$/gmu, ' ');
+ // 기사 메타데이터를 본문 요약 대상에서 제외한다.
+ source = source
+  .replace(/\[[^\]]*(?:사진|그래픽|이미지|출처|자료)[^\]]*\]/giu, " ")
+  .replace(/(?:사진|그래픽|이미지)\s*[|:：]\s*[^\n\.]*?(?=(?:\.|\n|$))/giu, " ")
+  .replace(/(?:저작권자|무단전재|무단 전재|Copyright)[^\n]*/giu, " ")
+  .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/gu, " ")
+  .replace(/(?:^|\n|\.)\s*[가-힣A-Za-z·]+(?:\s+[가-힣A-Za-z·]+){0,2}\s+(?:기자|특파원)\s*$/gmu, " ")
+  .replace(/\s+[가-힣A-Za-z·]+\s+(?:기자|특파원)\s*$/gu, " ");
  // 이미 HTML이 아닌 붙여넣기 텍스트에서도 흔한 뉴스 UI 문구를 제거한다.
  return source
   // 자연어 본문 속 '댓글은/추천은' 같은 단어를 UI로 오인하지 않도록
@@ -322,15 +330,20 @@ function summarizeV44Safe(source){
 function summarizeV45StructureSafe(source){
  const src=normalize(source), ss=splitSentences(src);
  if(!ss.length) return src;
- if(ss.length<=4) return summarizeV47Short(ss,src);
+ if(ss.length<=4){
+  const shortOut=summarizeV47Short(ss,src);
+  if(hasGrammarDamageV45(shortOut)) return ss.map(x=>safeCompressV44(x,src)).filter(Boolean).join(' ');
+  return shortOut;
+ }
  const profiles=ss.map((s,i)=>profileV45(s,i,ss.length));
- const selected=selectV45ByRoles(profiles,src);
+ const selected=rebalanceTopicDiversityV48(selectV45ByRoles(profiles,src),profiles,src);
  let parts=selected.map(p=>safeCompressV44(p.s,src)).filter(Boolean);
  parts=dedupeSafeV44(parts);
  let out=parts.join(' ');
  const argumentative=ss.length>=5 && ss.some(s=>/(?:그러나|하지만|반면|반대로|다만|만약|따라서|결국|않는다면|가능성|부작용|우려)/u.test(s));
+ const numericCount=extractNumericFactsV32(src).size;
  const minRatio=ss.length<=4?.30:(argumentative?.36:.32);
- const maxRatio=ss.length<=4?.70:(argumentative?.55:.45);
+ const maxRatio=ss.length<=4?(numericCount>=3?.68:.70):(numericCount>=5?.68:(argumentative?.55:.45));
  const minLen=Math.max(30,Math.floor(src.length*minRatio));
  const maxLen=Math.max(minLen+1,Math.floor(src.length*maxRatio));
  // 5문장 이상은 구조 보존을 위해 최대 3문장을 기본으로 유지한다.
@@ -339,7 +352,10 @@ function summarizeV45StructureSafe(source){
    let worst=-1,worstScore=Infinity;
    for(let i=0;i<selected.length;i++){
      if(selected[i].role==='topic' || selected[i].role==='conclusion') continue;
-     if(selected[i].score<worstScore){worst=i;worstScore=selected[i].score;}
+     const numericContribution=extractNumericFactsV32(selected[i].s).size;
+     const penalty=numericContribution*9;
+     const effective=selected[i].score-penalty;
+     if(effective<worstScore){worst=i;worstScore=effective;}
    }
    if(worst<0) break;
    selected.splice(worst,1); parts.splice(worst,1); out=parts.join(' ');
@@ -365,15 +381,123 @@ function summarizeV45StructureSafe(source){
  return out || safeCompressV44(ss[0],src);
 }
 
+function topicKeysFromSourceV48(source){
+ const generic=new Set('뉴스 기사 시장 사업 정책 문제 결과 전망 계획 방안 영향 규모 가격 판매 수요 공급 올해 내년 최근 이번 현재 관련 경우 시간 지역 국내 해외 전체 주요 증가 감소 대상 지원 이용 서비스 업체 기업 정부 국민 사회 분야 수준 상황 발표 진행 필요 효과 원인 내용'.split(' '));
+ const freq=new Map();
+ for(const t of tokenize(source)){
+  if(t.length<2 || generic.has(t) || /^\d/.test(t)) continue;
+  freq.set(t,(freq.get(t)||0)+1);
+ }
+ return [...freq.entries()].sort((a,b)=>b[1]-a[1]).slice(0,6).map(x=>x[0]);
+}
+
+function topicSignatureV48(sentence){
+ const s=normalize(sentence);
+ const tokens=tokenize(s);
+ const strong=[];
+ for(const t of tokens){
+  if(/^(?:애플|삼성|아이폰|갤럭시|서울대|서울대학교|부산|브라질|국토부|국토교통부|정부|중앙은행|한국은행|미국|중국|일본|AI|인공지능|카운터포인트|IDC|문학동네|한국문학번역원)$/iu.test(t)) strong.push(t.toLowerCase());
+ }
+ const nounish=tokens.filter(t=>t.length>=3 && !STOP.has(t) && !/^\d/.test(t));
+ return new Set((strong.length?strong:nounish.slice(0,8)).slice(0,10));
+}
+function topicOverlapV48(a,b){
+ const A=topicSignatureV48(a), B=topicSignatureV48(b);
+ if(!A.size||!B.size) return 0;
+ let n=0; for(const x of A) if(B.has(x)) n++;
+ return n/Math.max(1,A.size+B.size-n);
+}
+function rebalanceTopicDiversityV48(selected,profiles,src){
+ const out=[...selected]; if(out.length<3) return out;
+ const keys=topicKeysFromSourceV48(src);
+ const covered=new Set(out.flatMap(p=>[...tokenize(p.s)]));
+ // 주요 주제가 하나도 없는 경우, 해당 주제를 담은 후보를 하나 확보한다.
+ for(const key of keys.slice(0,4)){
+  if(covered.has(key)) continue;
+  const candidates=profiles.filter(q=>!out.some(x=>x.i===q.i)&&tokenize(q.s).includes(key));
+  candidates.sort((a,b)=>{
+   const va=a.nums*6+a.impact*3+(a.condition?5:0)+(a.conclusion?5:0);
+   const vb=b.nums*6+b.impact*3+(b.condition?5:0)+(b.conclusion?5:0);
+   return vb-va;
+  });
+  const alt=candidates[0];
+  if(!alt) continue;
+  // 첫 문장과 결론은 가급적 보존하고, 중간의 반복성이 높은 문장을 교체한다.
+  let replace=-1; let worst=Infinity;
+  for(let i=0;i<out.length;i++){
+   if(out[i].role==='topic'||out[i].role==='conclusion') continue;
+   const overlap=topicOverlapV48(out[i].s,alt.s);
+   const score=out[i].score-overlap*10;
+   if(score<worst){worst=score;replace=i;}
+  }
+  if(replace>=0){ out[replace]=alt; covered.add(key); }
+ }
+ // 같은 단일 주제가 세 문장 이상 차지하면, 다른 주제 후보로 하나 교체한다.
+ const counts=new Map();
+ for(const p of out) for(const t of topicSignatureV48(p.s)) counts.set(t,(counts.get(t)||0)+1);
+ const topKeys=keys.slice(0,4);
+ for(const key of topKeys){
+  let keyCount=out.filter(p=>tokenize(p.s).includes(key)).length;
+  while(keyCount>2){
+   let replace=-1; let weakest=Infinity;
+   for(let i=0;i<out.length;i++){
+    if(out[i].role==='topic'||out[i].role==='conclusion') continue;
+    if(!tokenize(out[i].s).includes(key)) continue;
+    const score=out[i].score + (out[i].nums*4);
+    if(score<weakest){weakest=score;replace=i;}
+   }
+   if(replace<0) break;
+   const alternatives=profiles.filter(q=>!out.some(x=>x.i===q.i)&&tokenize(q.s).some(t=>topKeys.includes(t))&&(!tokenize(q.s).includes(key)));
+   alternatives.sort((a,b)=>{
+    const da=topKeys.filter(k=>tokenize(a.s).includes(k)).length;
+    const db=topKeys.filter(k=>tokenize(b.s).includes(k)).length;
+    return (db*8+b.nums*5+b.impact*3)-(da*8+a.nums*5+a.impact*3);
+   });
+   if(!alternatives.length) break;
+   out[replace]=alternatives[0];
+   keyCount=out.filter(p=>tokenize(p.s).includes(key)).length;
+  }
+ }
+ for(let i=0;i<out.length;i++){
+  const p=out[i]; const overloaded=[...topicSignatureV48(p.s)].filter(t=>(counts.get(t)||0)>=3);
+  if(!overloaded.length) continue;
+  const alternatives=profiles.filter(q=>!out.some(x=>x.i===q.i));
+  alternatives.sort((a,b)=>{
+   const da=[...topicSignatureV48(a.s)].filter(t=>(counts.get(t)||0)===0).length;
+   const db=[...topicSignatureV48(b.s)].filter(t=>(counts.get(t)||0)===0).length;
+   return (db*7+b.nums*5+b.impact*3)-(da*7+a.nums*5+a.impact*3);
+  });
+  const alt=alternatives[0];
+  if(!alt) continue;
+  for(const t of topicSignatureV48(p.s)) counts.set(t,Math.max(0,(counts.get(t)||1)-1));
+  for(const t of topicSignatureV48(alt.s)) counts.set(t,(counts.get(t)||0)+1);
+  out[i]=alt;
+ }
+ return out.sort((a,b)=>a.i-b.i);
+}
+
 function summarizeV47Short(ss,src){
  // V47: 짧은 글도 '모든 문장 보존'을 기본값으로 삼지 않는다.
  // 문장 후보, 1~2문장 조합, 숫자 중심 후보를 만든 뒤 정보 보존/압축률을 함께 평가한다.
  const sourceNums=extractNumericFactsV32(src);
+ const sourceNumericTokens=new Set((src.match(/\d+(?:\.\d+)?(?:만|억|조|%|원|명|곳|회|일|년|월)?/gu)||[]));
  const sourceAnchors=extractInformationAnchors(src);
+ // 짧은 고밀도 글은 세 문장을 억지로 한두 문장으로 줄여 수치를 버리지 않는다.
+ if(ss.length<=4 && sourceNumericTokens.size>=3){
+  const joined=ss.map(s=>safeCompressV44(s,src)).filter(Boolean).join(' ');
+  const compact=makeOneSentence(compactSummarySentenceV34(joined,src)||compressShortNumericSummaryV47(ss)||joined);
+  const candidates=[joined,compact].filter(Boolean);
+  for(const candidate of candidates){
+   const joinedNumericTokens=new Set((candidate.match(/\d+(?:\.\d+)?(?:만|억|조|%|원|명|곳|회|일|년|월)?/gu)||[]));
+   const joinedRatio=candidate.length/src.length;
+   const allNumbers=[...sourceNumericTokens].every(x=>joinedNumericTokens.has(x));
+   if(allNumbers && joinedRatio>=.30 && joinedRatio<=.72 && isSafeCompressionV44(src,candidate)) return sanitizeSafeV44(candidate,src);
+  }
+ }
  const sourceRoles=classifyLogicalRolesV25(src);
  const targetMin=Math.floor(src.length*.30);
- const targetMax=Math.floor(src.length*(sourceNums.size>=2 ? .58 : .50));
- const hardMax=Math.floor(src.length*(sourceNums.size>=2?.80:.68));
+ const targetMax=Math.floor(src.length*(sourceNums.size>=3 ? .68 : (sourceNums.size>=2 ? .58 : .50)));
+ const hardMax=Math.floor(src.length*(sourceNums.size>=3?.82:(sourceNums.size>=2?.80:.68)));
 
  const base=ss.map((s,i)=>({
   i, raw:s,
@@ -483,12 +607,14 @@ function profileV45(s,i,total){
  const condition=/(?:만약|경우|전제|조건|다만|제외|예외|원칙|제한|반대로|반면|그러나|하지만|않으면|않는다면|따라서)/u.test(s);
  const conclusion=/(?:결국|따라서|결론적으로|이처럼|이유|필요|해야|우려|경고|촉구|대체할 수|핵심|전망|예상)/u.test(s);
  const causal=/(?:때문|따라|통해|으로 인해|으로 인한|원인|이에 따라|이어져|초래|발생|확보)/u.test(s);
+ const comparison=/(?:반면|반대로|둘 중|양측|양사|양 사|경쟁|비교|같은|차이|누가|어느 쪽|두 제품|두 기업|두 공룡)/u.test(s);
  let role='detail';
  if(i===0) role='topic';
+ else if(comparison) role='comparison';
  else if(conclusion && i>=total-2) role='conclusion';
  else if(condition) role='condition';
  else if(causal || nums>0 || impact>0) role='evidence';
- let score=nums*6+anchors*2+roles*2+impact*4+(condition?9:0)+(conclusion?8:0)+(causal?5:0);
+ let score=nums*6+anchors*2+roles*2+impact*4+(condition?9:0)+(conclusion?8:0)+(causal?5:0)+(comparison?10:0);
  if(i===0) score+=10;
  if(i===total-1) score+=7;
  return {s,i,total,nums,anchors,roles,impact,condition,conclusion,causal,role,score};
@@ -499,6 +625,7 @@ function v45AddValue(p,selected){
  if(!selected.some(x=>x.role==='condition') && p.condition) v+=18;
  if(!selected.some(x=>x.role==='evidence') && p.role==='evidence') v+=12;
  if(!selected.some(x=>x.role==='conclusion') && p.conclusion) v+=15;
+ if(!selected.some(x=>x.role==='comparison') && p.role==='comparison') v+=18;
  if(p.nums>0 && !selected.some(x=>x.nums>0)) v+=10;
  if(p.i===p.total-1) v+=4;
  return v;
@@ -518,7 +645,10 @@ function selectV45ByRoles(profiles,src){
  // 2) 조건/예외/반론을 하나 확보한다. 결론과 같은 문장이라면 다음 후보를 찾는다.
  const conditions=pool.filter(p=>p.condition&&!selected.some(x=>x.i===p.i)).sort((a,b)=>value(b)-value(a));
  if(conditions.length) selected.push(conditions[0]);
- // 3) 결과/수치/인과 근거를 확보한다. 특히 한 문장에 여러 수치가 몰려 있으면 우선한다.
+ // 3) 비교/경쟁 구조가 있는 글은 양측을 연결하는 비교 문장을 반드시 하나 확보한다.
+ const comparisons=pool.filter(p=>!selected.some(x=>x.i===p.i)&&p.role==='comparison').sort((a,b)=>value(b)-value(a));
+ if(comparisons.length) selected.push(comparisons[0]);
+ // 4) 결과/수치/인과 근거를 확보한다. 특히 한 문장에 여러 수치가 몰려 있으면 우선한다.
  const evidence=pool.filter(p=>!selected.some(x=>x.i===p.i)&& (p.role==='evidence'||p.nums>0||p.impact>0))
    .sort((a,b)=>{
       const resultA=/(?:향상|단축|감소|증가|상승|하락|줄어|늘어|개선|절감|낮아|높아)/u.test(a.s);
@@ -528,7 +658,16 @@ function selectV45ByRoles(profiles,src){
       return bv-av;
    });
  if(evidence.length) selected.push(evidence[0]);
- // 4) '사람 문제가 아니라 시스템 문제'처럼 글의 진단축을 담은 문장을
+ // 4) 숫자가 여러 문장에 흩어진 글은 아직 선택되지 않은 수치 묶음을 하나 더 확보한다.
+ const chosenNums=new Set(selected.flatMap(p=>[...extractNumericFactsV32(p.s)]));
+ const numericGap=pool.filter(p=>!selected.some(x=>x.i===p.i)&&extractNumericFactsV32(p.s).size>0)
+   .sort((a,b)=>{
+      const ga=[...extractNumericFactsV32(a.s)].filter(x=>!chosenNums.has(x)).length;
+      const gb=[...extractNumericFactsV32(b.s)].filter(x=>!chosenNums.has(x)).length;
+      return (gb*8+b.score)-(ga*8+a.score);
+   });
+ if(numericGap.length) selected.push(numericGap[0]);
+ // 5) '사람 문제가 아니라 시스템 문제'처럼 글의 진단축을 담은 문장을
  // 별도 역할로 확보한다. 단순 수치만 남으면 논설문의 핵심 논지가 사라진다.
  const diagnosis=pool.filter(p=>!selected.some(x=>x.i===p.i) &&
    /(?:시스템 문제|구조적 문제|문제는|원인은|실패|도달하지 못|목표에|한계|병목|체질|운영시스템|조직문화)/u.test(p.s))
@@ -582,7 +721,10 @@ function isSafeCompressionV44(original,candidate){
  const b=new Set(tokenize(candidate));
  let common=0; for(const x of b) if(a.has(x)) common++;
  const overlap=b.size?common/b.size:0;
- if(overlap<.55) return false;
+ if(overlap<.80) return false;
+ // 주어가 통째로 잘려 나가는 압축은 금지한다. 첫 번째 핵심 토큰이 살아 있어야 한다.
+ const origTokens=tokenize(original), candTokens=tokenize(candidate);
+ if(origTokens.length>=2 && !candTokens.includes(origTokens[0])) return false;
  // 압축 결과가 원문의 연속 절을 두 번 반복하는 경우 거부한다.
  for(let len=12;len<=Math.min(35,Math.floor(candidate.length/2));len++){
   for(let i=0;i+len<=candidate.length;i++){
@@ -595,6 +737,13 @@ function isSafeCompressionV44(original,candidate){
 
 function hasGrammarDamageV45(s){
  // V39의 공격적인 조사/어미 삭제로 생기는 대표적인 비문 패턴을 차단한다.
+ if(/:/u.test(s)){
+  const parts=s.split(':');
+  const before=tokenize(parts[0]);
+  const after=tokenize(parts.slice(1).join(':')).slice(0,2);
+  if(before.some(x=>after.some(y=>x.length>=3&&y.length>=2&&(x.includes(y)||y.includes(x))))) return true;
+ }
+ if(/(?:\s|^)(?:등|및|또한|그리고|그러나|하지만|반면|따라서|결국)\.?$/u.test(s)) return true;
  if(/(?:[가-힣]{2,}(?:은|는|이|가|을|를|과|와|로|으로))\s+(?:받아|인정|수용|생각|느끼|보이|말하|판단|분석|설명|강조|지적|요구|추진|지원|제공|확대|감축)/u.test(s)) return true;
  if(/(?:있는|없는|하는|되는|된|한)\s+(?:받아|인정|수용|생각|느끼|보이|말하|판단|분석|설명|강조|지적|요구|추진|지원|제공|확대|감축)/u.test(s)) return true;
  if(/(?:[가-힣]{2,})로\s+(?:인해|인한|부터|대해|통해)/u.test(s)) return true;

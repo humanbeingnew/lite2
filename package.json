@@ -2,8 +2,8 @@
   "name": "lite-paragraph-summarizer",
   "private": true,
   "type": "module",
-  "version": "47.0.0",
-  "description": "Free Korean news and document summarizer for Cloudflare Workers (V47 Coherent Structure, short-text numeric preservation, 30-45% range)",
+  "version": "48.0.0",
+  "description": "Free Korean news and document summarizer for Cloudflare Workers (V48 topic balance, metadata filtering, short dense text safety)",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
